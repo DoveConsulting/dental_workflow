@@ -22,6 +22,35 @@ CENTER = [0.0, 0.0, 0.0]         # look-at target
 
 
 
+def align_to_principal_axes(mesh):
+    """Align mesh to principal axes of inertia, widest section in XY plane.
+
+    Computes the covariance matrix of the mesh vertices, then rotates so
+    that the eigenvector with the *smallest* eigenvalue (least spread)
+    maps to Z, leaving the two directions with most spread in XY.
+    """
+    vertices = np.asarray(mesh.vertices)
+    centroid = vertices.mean(axis=0)
+    centered = vertices - centroid
+
+    # Covariance matrix of vertex positions
+    cov = np.cov(centered, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+    # eigh returns eigenvalues in ascending order.
+    # eigenvalues[0] = smallest spread  → map to Z
+    # eigenvalues[1], eigenvalues[2]    → map to X, Y (widest in XY)
+    # Rearrange so columns are: largest, middle, smallest → X, Y, Z
+    rot = eigenvectors[:, [2, 1, 0]]
+
+    # Ensure right-handed coordinate system
+    if np.linalg.det(rot) < 0:
+        rot[:, 2] = -rot[:, 2]
+
+    mesh.rotate(rot.T, center=centroid)
+    return mesh
+
+
 def mesh_to_pointcloud(mesh, number_of_points=100_000):
     """Convert a mesh to a point cloud by sampling points on its surface."""
     # resulting point cloud should have uniform density across the mesh surface
@@ -82,8 +111,10 @@ else:
         mesh.compute_vertex_normals()
         mesh.paint_uniform_color([0.95, 0.93, 0.88])
 
-        # Center and compute camera radius
+        # Align to principal axes (widest section in XY), then center
         mesh.translate(-mesh.get_center())
+        align_to_principal_axes(mesh)
+        mesh.translate(-mesh.get_center())   # re-center after rotation
         bbox   = mesh.get_axis_aligned_bounding_box()
         extent = bbox.get_max_extent()
         radius = extent * 1.5
