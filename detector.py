@@ -1,6 +1,8 @@
 import os
 import re
 import math
+import random
+import colorsys
 import numpy as np
 import cv2
 import open3d as o3d
@@ -21,14 +23,12 @@ MESH_UNITS      = "mm"
 UNITS_PER_CM    = {"mm": 10.0, "cm": 1.0, "m": 0.01}[MESH_UNITS]
 BOX_HALF_HEIGHT = 3.0 * UNITS_PER_CM  # step 7: box spans this far above AND below Z=0
 
-# Only labels present in this dict get segmented + colored in step 8.
-# ToothBottom is deliberately excluded — it's only used as a selection
-# criterion in step 5, never rendered.
-LABEL_COLORS = {
-    "ToothTop":  (0.0, 1.0, 0.0),   # green
-    "Connector": (1.0, 1.0, 0.0),   # yellow
-    "ToothBottom": (1.0, 0.0, 0.0),   # red
-}
+# Labels in this set get cropped into their own point-cloud segment in
+# step 7 and rendered onto the mesh in step 8. Each segment gets its own
+# random color (see random_segment_color()) rather than a fixed per-label
+# color, so individual detections stay visually distinguishable even when
+# they share a label.
+SEGMENT_LABELS = {"ToothTop", "Connector", "ToothBottom"}
 
 # ── Debug annotation styling (step 4) ───────────────────────────
 LABEL_FONT_SCALE = 0.75   # multiplier for annotation label text size
@@ -36,8 +36,8 @@ LABEL_OPACITY    = 0.75   # 0.0 (invisible) .. 1.0 (fully opaque) for boxes + la
 SHOW_CONFIDENCE  = False  # append the confidence score to the annotation label
 
 # BGR (OpenCV order) colors used to draw detections on the debug images.
-# Covers all three labels, unlike LABEL_COLORS above which only covers the
-# two that get segmented onto the mesh.
+# Covers all three labels, unlike SEGMENT_LABELS above which only controls
+# which labels get cropped into a 3D point-cloud segment.
 ANNOTATION_COLORS = {
     "ToothTop":    (0, 255, 0),    # green
     "ToothBottom": (0, 0, 255),    # red
@@ -318,17 +318,25 @@ def points_in_box(points, x_range, y_range, z_half_height=BOX_HALF_HEIGHT):
     )
 
 
+def random_segment_color():
+    """A vivid, well-saturated random RGB color (0..1 range, as Open3D
+    expects). Random hue with fixed saturation/value keeps colors bright
+    and distinguishable instead of muddy or too dark to see."""
+    hue = random.random()
+    return colorsys.hsv_to_rgb(hue, 0.85, 0.95)
+
+
 def segment_pointcloud(pcd, detections, view_capture):
-    """Steps 7 & 8: crop the point cloud per-detection and color each
-    segment (green = ToothTop, yellow = Connector)."""
+    """Steps 7 & 8: crop the point cloud per-detection and give each
+    resulting segment its own random color, so individual detections stay
+    visually distinguishable even when they share the same label."""
     points = np.asarray(pcd.points)
     depth, eye, up = view_capture["depth"], view_capture["eye"], view_capture["up"]
 
     segments = []
     for det in detections:
-        color = LABEL_COLORS.get(det["label"])
-        if color is None:
-            continue  # e.g. ToothBottom — not part of the overlay
+        if det["label"] not in SEGMENT_LABELS:
+            continue
 
         xy = unproject_bbox_to_xy(det["bbox"], depth, eye, up, IMAGE_WIDTH, IMAGE_HEIGHT)
         if xy is None:
@@ -341,7 +349,7 @@ def segment_pointcloud(pcd, detections, view_capture):
 
         segment = o3d.geometry.PointCloud()
         segment.points = o3d.utility.Vector3dVector(points[mask])
-        segment.paint_uniform_color(color)
+        segment.paint_uniform_color(random_segment_color())
         segments.append(segment)
 
     return segments
