@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import numpy as np
 import cv2
@@ -6,9 +7,9 @@ import open3d as o3d
 from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────
-STL_DIR         = "stl"              # folder of .stl files to process (mirrors training_data_collection.py)
+STL_DIR         = "stl_test"              # folder of .stl files to process (mirrors training_data_collection.py)
 OUTPUT_DIR      = "detections"       # debug images + final overlays are written here
-MODEL_PATH      = "weights/best.pt"  # YOLO detector trained on ToothTop / ToothBottom / Connector
+MODEL_PATH      = "ai_model/best.pt"  # YOLO detector trained on ToothTop / ToothBottom / Connector
 IMAGE_WIDTH     = 1920
 IMAGE_HEIGHT    = 1080
 FOV_DEG         = 60.0
@@ -26,7 +27,23 @@ BOX_HALF_HEIGHT = 3.0 * UNITS_PER_CM  # step 7: box spans this far above AND bel
 LABEL_COLORS = {
     "ToothTop":  (0.0, 1.0, 0.0),   # green
     "Connector": (1.0, 1.0, 0.0),   # yellow
+    "ToothBottom": (1.0, 0.0, 0.0),   # red
 }
+
+# ── Debug annotation styling (step 4) ───────────────────────────
+LABEL_FONT_SCALE = 0.75   # multiplier for annotation label text size
+LABEL_OPACITY    = 0.75   # 0.0 (invisible) .. 1.0 (fully opaque) for boxes + label text
+SHOW_CONFIDENCE  = False  # append the confidence score to the annotation label
+
+# BGR (OpenCV order) colors used to draw detections on the debug images.
+# Covers all three labels, unlike LABEL_COLORS above which only covers the
+# two that get segmented onto the mesh.
+ANNOTATION_COLORS = {
+    "ToothTop":    (0, 255, 0),    # green
+    "ToothBottom": (0, 0, 255),    # red
+    "Connector":   (0, 255, 255),  # yellow
+}
+DEFAULT_ANNOTATION_COLOR = (255, 255, 255)  # white, used for any unlisted label
 
 CENTER = [0.0, 0.0, 0.0]  # look-at target, mesh is always re-centered to the origin
 
@@ -67,7 +84,7 @@ def align_to_principal_axes(mesh):
     return mesh
 
 
-def mesh_to_pointcloud(mesh, number_of_points=100_000):
+def mesh_to_pointcloud(mesh, number_of_points=10_000):
     """Convert a mesh to a point cloud by sampling points on its surface."""
     return mesh.sample_points_uniformly(number_of_points=number_of_points)
 
@@ -100,7 +117,7 @@ def prepare_mesh(mesh):
 
 
 # ── Step 3: capture top & bottom views on black background ─────
-def capture_top_bottom_views(mesh, stem):
+def capture_top_bottom_views(mesh, out_dir):
     bbox = mesh.get_axis_aligned_bounding_box()
     radius = bbox.get_max_extent() * 1.5
 
@@ -117,7 +134,7 @@ def capture_top_bottom_views(mesh, stem):
     for name, params in views.items():
         renderer.setup_camera(FOV_DEG, np.array(CENTER), np.array(params["eye"]), np.array(params["up"]))
 
-        img_path = os.path.join(OUTPUT_DIR, f"{name}_{stem}.png")
+        img_path = os.path.join(out_dir, f"{name}.png")
         o3d.io.write_image(img_path, renderer.render_to_image())
         print(f"  ✓ saved {img_path}")
 
@@ -138,32 +155,114 @@ def capture_top_bottom_views(mesh, stem):
 
 
 # ── Step 4: run inference on the captured images ────────────────
-def run_inference(image_path, stem, view_name):
+# Explicit abbreviations for known labels; anything else falls back to the
+# initials of its capitalized words (e.g. a future 'GumLine' -> 'GL').
+LABEL_ABBREVIATIONS = {
+    "ToothTop":    "TT",
+    "ToothBottom": "TB",
+    "Connector":   "C",
+}
+
+
+def sanitize_label(label):
+    """Abbreviated, uppercase-letters-only annotation text for a label
+    (e.g. 'ToothTop' -> 'TT', 'ToothBottom' -> 'TB', 'Connector' -> 'C')."""
+    if label in LABEL_ABBREVIATIONS:
+        return LABEL_ABBREVIATIONS[label]
+
+    words = re.findall(r"[A-Z][a-z]*", label)
+    if words:
+        return "".join(word[0] for word in words).upper()
+
+    return re.sub(r"[^A-Za-z]", "", label).upper()
+
+
+def draw_detections(image_path, detections, out_path,
+                     font_scale=LABEL_FONT_SCALE,
+                     opacity=LABEL_OPACITY,
+                     show_confidence=SHOW_CONFIDENCE):
+    """Draw bounding boxes (rotated, if the model is OBB) and abbreviated
+    labels onto the captured image and save it for debugging.
+
+    font_scale       - scales the label text size
+    opacity          - 0.0 (invisible) .. 1.0 (fully opaque), applies to
+                        both the box outline/fill and the label text
+    show_confidence  - append the detection confidence to the label text
+    """
+    base = cv2.imread(image_path)
+    overlay = base.copy()
+    thickness = max(1, round(font_scale * 5))
+
+    for det in detections:
+        color = ANNOTATION_COLORS.get(det["label"], DEFAULT_ANNOTATION_COLOR)
+
+        if "obb_corners" in det:
+            pts = np.array(det["obb_corners"], dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=thickness)
+            tx, ty = det["obb_corners"][0]
+            tx, ty = int(tx), int(ty)
+        else:
+            x1, y1, x2, y2 = map(int, det["bbox"])
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=thickness)
+            tx, ty = x1, y1
+
+        label_text = sanitize_label(det["label"])
+        if show_confidence:
+            label_text = f"{label_text} {det['confidence']:.2f}"
+
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+        ty = max(ty, text_h + baseline + 4)  # keep the label on-screen near the top edge
+        cv2.rectangle(overlay, (tx, ty - text_h - baseline - 4), (tx + text_w + 4, ty), color, thickness=-1)
+        cv2.putText(
+            overlay, label_text, (tx + 2, ty - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA
+        )
+
+    # Blending the whole frame is equivalent to blending just the drawn
+    # regions, since overlay == base everywhere nothing was drawn.
+    blended = cv2.addWeighted(overlay, opacity, base, 1 - opacity, 0)
+    cv2.imwrite(out_path, blended)
+
+
+def run_inference(image_path, out_dir, view_name):
     model = get_model()
     results = model.predict(source=image_path, conf=CONF_THRESHOLD, verbose=False)[0]
 
+    # OBB (oriented bounding box) models populate results.obb and leave
+    # results.boxes as None — regular detection models are the reverse.
+    # OBB items expose the same .cls/.conf as Boxes, plus .xyxy (the
+    # axis-aligned box enclosing the rotated box) and .xyxyxyxy (the
+    # actual 4 rotated corner points, kept for a tighter crop later if needed).
+    is_obb = results.obb is not None
+    preds = results.obb if is_obb else results.boxes
+
     detections = []
-    for box in results.boxes:
+    for box in preds:
         label = results.names[int(box.cls[0])]
         x1, y1, x2, y2 = box.xyxy[0].tolist()
-        detections.append({
+        detection = {
             "label": label,
             "confidence": float(box.conf[0]),
             "bbox": (x1, y1, x2, y2),
-        })
+        }
+        if is_obb:
+            detection["obb_corners"] = box.xyxyxyxy[0].tolist()  # [[x,y], [x,y], [x,y], [x,y]]
+        detections.append(detection)
 
-    debug_path = os.path.join(OUTPUT_DIR, f"inference_{view_name}_{stem}.png")
-    cv2.imwrite(debug_path, results.plot())
+    debug_path = os.path.join(out_dir, f"inference_{view_name}.png")
+    draw_detections(image_path, detections, debug_path)
     print(f"  ✓ saved {debug_path} ({len(detections)} detections)")
     return detections
 
 
 # ── Step 5: select the view that has no 'ToothBottom' label ────
-def select_valid_view(captures, detections_by_view, stem):
+def select_valid_view(captures, detections_by_view, out_dir):
     for view_name in ("top", "bottom"):
         dets = detections_by_view[view_name]
         if not any(d["label"] == "ToothBottom" for d in dets):
-            chosen_path = os.path.join(OUTPUT_DIR, f"chosen_{view_name}_{stem}.png")
+            chosen_path = os.path.join(out_dir, f"chosen_{view_name}.png")
             o3d.io.write_image(chosen_path, o3d.io.read_image(captures[view_name]["image_path"]))
             print(f"  ✓ '{view_name}' view has no ToothBottom labels — using it ({chosen_path})")
             return view_name, dets
@@ -248,31 +347,36 @@ def segment_pointcloud(pcd, detections, view_capture):
     return segments
 
 
-# ── Step 9: isometric capture of the mesh + overlaid segments ──
-def capture_overlay_view(mesh, segments, stem):
+# ── Step 9: top, bottom & isometric captures of the mesh + overlaid segments ──
+def capture_overlay_view(mesh, segments, out_dir):
     bbox = mesh.get_axis_aligned_bounding_box()
     radius = bbox.get_max_extent() * 1.8
-
-    # top-down isometric-style vantage point
-    eye = [radius * 0.7, -radius * 0.7, radius * 0.7]
-    up = [0, 0, 1]
-
+ 
+    views = {
+        "top":       {"eye": [0, 0,  radius], "up": [0, 1, 0]},
+        "bottom":    {"eye": [0, 0, -radius], "up": [0, 1, 0]},
+        "isometric": {"eye": [radius * 0.7, -radius * 0.7, radius * 0.7], "up": [0, 0, 1]},
+    }
+ 
     renderer = o3d.visualization.rendering.OffscreenRenderer(IMAGE_WIDTH, IMAGE_HEIGHT)
     renderer.scene.set_background([0.0, 0.0, 0.0, 1.0])
-
+ 
     dim_mat = make_material(mesh, color=(0.35, 0.35, 0.35))
     renderer.scene.add_geometry("mesh", mesh, dim_mat)
-
+ 
     for i, segment in enumerate(segments):
         renderer.scene.add_geometry(f"segment_{i}", segment, make_material(segment, point_size=4.0))
-
-    renderer.setup_camera(FOV_DEG, np.array(CENTER), np.array(eye), np.array(up))
-    out_path = os.path.join(OUTPUT_DIR, f"overlay_{stem}.png")
-    o3d.io.write_image(out_path, renderer.render_to_image())
-    print(f"  ✓ saved {out_path}")
-
+ 
+    out_paths = {}
+    for name, params in views.items():
+        renderer.setup_camera(FOV_DEG, np.array(CENTER), np.array(params["eye"]), np.array(params["up"]))
+        out_path = os.path.join(out_dir, f"overlay_{name}.png")
+        o3d.io.write_image(out_path, renderer.render_to_image())
+        print(f"  ✓ saved {out_path}")
+        out_paths[name] = out_path
+ 
     del renderer
-    return out_path
+    return out_paths
 
 
 # ── Per-file pipeline (steps 1-9) ────────────────────────────────
@@ -280,17 +384,27 @@ def process_stl(stl_path):
     stem = os.path.splitext(os.path.basename(stl_path))[0]
     print(f"\nProcessing {stl_path} ...")
 
+    # Everything this run produces for this mesh lands under its own
+    # subdirectory, named after the source file (e.g. detections/<stem>/...).
+    out_dir = os.path.join(OUTPUT_DIR, stem)
+    os.makedirs(out_dir, exist_ok=True)
+
     mesh = load_stl(stl_path)                                     # 1
+
     mesh = prepare_mesh(mesh)                                     # 2
-    captures = capture_top_bottom_views(mesh, stem)                # 3
+    output_path = os.path.join(out_dir, "aligned.stl")
+    o3d.io.write_triangle_mesh(output_path, mesh)
+
+
+    captures = capture_top_bottom_views(mesh, out_dir)             # 3
 
     detections_by_view = {                                        # 4
-        view: run_inference(data["image_path"], stem, view)
+        view: run_inference(data["image_path"], out_dir, view)
         for view, data in captures.items()
     }
 
     chosen_view, chosen_detections = select_valid_view(            # 5
-        captures, detections_by_view, stem
+        captures, detections_by_view, out_dir
     )
 
     pcd = mesh_to_pointcloud(mesh)                                  # 6
@@ -299,7 +413,7 @@ def process_stl(stl_path):
         pcd, chosen_detections, captures[chosen_view]
     )
 
-    capture_overlay_view(mesh, segments, stem)                      # 9
+    capture_overlay_view(mesh, segments, out_dir)                   # 9
 
 
 # ── Entry point ───────────────────────────────────────────────
