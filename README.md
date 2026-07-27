@@ -1,125 +1,56 @@
-# Dental STL Defect Annotation Pipeline
+# Dental STL Detection & Segmentation Pipeline
 
-A Python-based workflow for loading dental STL models, capturing multi-view renders, and annotating defects in Label Studio.
+A Python-based workflow for loading dental STL models, capturing multi-view renders, annotating data in Label Studio, training a YOLO OBB detector, and running inference to produce 3D point-cloud segmentations.
 
 ---
 
-## Step 1 - Install Needed Software in Python Virtual Environment
+## Installation
+
+**Requirements:** Python 3.9+
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install open3d numpy Pillow label-studio label-studio-sdk
+pip install open3d numpy opencv-python Pillow ultralytics label-studio label-studio-sdk
 ```
+
+> **GPU training (recommended):** install the CUDA-enabled PyTorch build before `ultralytics`:
+> ```bash
+> pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+> pip install ultralytics
+> ```
 
 ---
 
-## Step 2 — Load STL file and Render Five Views and Save Screenshots
+## Step 1 — Render Training Images (`training_data_collection.py`)
 
-Each view is defined by positioning a virtual camera around the mesh's center.
-The helper below uses Open3D's offscreen renderer so no GUI window is needed.
+### `training_data_collection.py` — Render training images from STL files
 
-```python
-import os
-import math
-import open3d as o3d
-import numpy as np
+Loads every `.stl` file in the `stl/` folder, aligns each mesh to its principal axes, renders 5 views (front, back, left, right, top) and saves them to `renders/`.
 
-# ── Configuration ──────────────────────────────────────────────
-STL_PATH       = "0035.stl"
-OUTPUT_DIR     = "renders"
-IMAGE_WIDTH    = 1920
-IMAGE_HEIGHT   = 1080
-
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ── Load mesh ──────────────────────────────────────────────────
-mesh = o3d.io.read_triangle_mesh(STL_PATH)
-mesh.compute_vertex_normals()
-mesh.paint_uniform_color([0.95, 0.93, 0.88])
-
-# Center the mesh at the origin and get its bounding sphere
-mesh.translate(-mesh.get_center())
-bbox   = mesh.get_axis_aligned_bounding_box()
-extent = bbox.get_max_extent()
-radius = extent * 1.5            # camera distance from center
-
-
-# ── Define the five view directions ────────────────────────────
-# Each entry: (name, eye_position, up_vector)
-VIEWS = {
-    "front":  {"eye": [0,  0,  radius], "up": [0, 1, 0]},
-    "back":   {"eye": [0,  0, -radius], "up": [0, 1, 0]},
-    "left":   {"eye": [-radius, 0, 0],  "up": [0, 1, 0]},
-    "right":  {"eye": [radius,  0, 0],  "up": [0, 1, 0]},
-    "top":    {"eye": [0, radius,  0],  "up": [0, 0, -1]},
-}
-
-CENTER = [0.0, 0.0, 0.0]         # look-at target
-
-
-# ── Capture helper using OffscreenRenderer ─────────────────────
-def capture_view(mesh, eye, up, center, width, height, save_path):
-    """Render the mesh from a given viewpoint and save to disk."""
-    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
-    renderer.scene.set_background([1.0, 1.0, 1.0, 1.0])  # white bg
-
-    # Material
-    mat = o3d.visualization.rendering.MaterialRecord()
-    mat.shader = "defaultLit"
-    mat.base_color = [0.95, 0.93, 0.88, 1.0]
-
-    renderer.scene.add_geometry("dental_mesh", mesh, mat)
-
-    # Camera
-    renderer.setup_camera(
-        60.0,                       # vertical field-of-view (degrees)
-        np.array(center),           # look-at point
-        np.array(eye),              # camera position
-        np.array(up)                # up vector
-    )
-
-    # Render and save
-    img = renderer.render_to_image()
-    o3d.io.write_image(save_path, img)
-    print(f"  ✓ saved {save_path}")
-
-    renderer.scene.remove_geometry("dental_mesh")
-    del renderer
-
-
-# ── Render each view ───────────────────────────────────────────
-filename = os.path.basename(STL_PATH)
-saved_paths = []
-
-for name, params in VIEWS.items():
-    path = os.path.join(OUTPUT_DIR, f"{os.path.splitext(filename)[0]}_{name}.png")
-    capture_view(
-        mesh,
-        eye=params["eye"],
-        up=params["up"],
-        center=CENTER,
-        width=IMAGE_WIDTH,
-        height=IMAGE_HEIGHT,
-        save_path=path,
-    )
-    saved_paths.append(path)
-
-print(f"\nAll {len(saved_paths)} views saved to '{OUTPUT_DIR}/'")
+```bash
+python training_data_collection.py
 ```
-<img src="sample_capture.png" alt="Sample Capture" width="50%"/>
+
+Key configuration (edit at the top of the file):
+
+| Variable | Default | Description |
+|---|---|---|
+| `STL_DIR` | `stl` | Folder containing source `.stl` files |
+| `OUTPUT_DIR` | `renders` | Where rendered images are saved |
+| `USE_POINTCLOUD` | `False` | Render as point cloud instead of mesh |
+
 ---
 
-## Step 3 — Install and Launch Label Studio
+## Step 2 — Install and Launch Label Studio
 
-### 3a. Install
+### 2a. Install
 
 ```bash
 pip install label-studio
 ```
 
-### 3b. Launch
+### 2b. Launch
 
 ```bash
 # Start the server on the default port 8080
@@ -131,18 +62,18 @@ After that, the web UI is available at **http://localhost:8080**.
 
 ---
 
-## Step 4 — Set Up a Project and Upload Images (GUI)
+## Step 3 — Set Up a Project and Upload Images (GUI)
 
 All project setup is done through the Label Studio web interface at
 **http://localhost:8080**.
 
-### 4a. Create an Account (First Launch Only)
+### 3a. Create an Account (First Launch Only)
 
 1. Open **http://localhost:8080** in your browser.
 2. You will see the **Sign Up** page. Enter your email and a password.
 3. Click **Create Account**. You are now logged in to the dashboard.
 
-### 4b. Create a New Project
+### 3b. Create a New Project
 
 1. On the dashboard, click the **Create Project** button (top-left).
 2. In the dialog that appears, fill in the **Project Name** field:
@@ -151,7 +82,7 @@ All project setup is done through the Label Studio web interface at
    `Annotate defects on multi-view dental model renders.`
 4. Do **not** click Create yet — move to the next tabs first.
 
-### 4c. Upload the Rendered Images
+### 3c. Upload the Rendered Images
 
 1. In the same Create Project dialog, click the **Data Import** tab.
 2. Click **Upload Files** and navigate to your `renders/` folder.
@@ -160,7 +91,7 @@ All project setup is done through the Label Studio web interface at
 4. Wait for the upload progress bar to complete.
 5. You should see all tasks listed in the preview table.
 
-### 4d. Configure the Labeling Interface
+### 3d. Configure the Labeling Interface
 
 1. Still in the Create Project dialog, click the **Labeling Setup** tab.
 2. In the template gallery on the left, select **Computer Vision → Object
@@ -198,9 +129,9 @@ All project setup is done through the Label Studio web interface at
 
 ---
 
-## Step 5 — Annotate Defects and Export Results (GUI)
+## Step 4 — Annotate Defects and Export Results (GUI)
 
-### 5a. Annotate an Image
+### 4a. Annotate an Image
 
 1. From the project task list, click any row (e.g. `front.png`) to open
    the labeling editor.
@@ -222,7 +153,7 @@ All project setup is done through the Label Studio web interface at
 
 <img src="labelStudio.png" alt="LabelStudio" width="50%"/>
 
-### 5b. Review Annotations
+### 4b. Review Annotations
 
 1. Return to the project task list by clicking the project name in the
    breadcrumb at the top.
@@ -231,7 +162,7 @@ All project setup is done through the Label Studio web interface at
 4. The **Filters** bar at the top lets you filter by label, annotator, or
    completion status (e.g. show only unannotated tasks).
 
-### 5c. Export Annotations (DO THIS ONLY WHEN DONE WITH ALL ANNOTATIONS)
+### 4c. Export Annotations (DO THIS ONLY WHEN DONE WITH ALL ANNOTATIONS)
 
 1. From the project task list, click the **Export** button (top-right).
 2. Label Studio shows a list of export formats. Choose **YOLOv8 OBB with Images**.
@@ -240,3 +171,128 @@ All project setup is done through the Label Studio web interface at
    downloads to your browser's default download folder.
 
 ---
+
+## Step 5 — Train YOLO OBB Model (`split_and_train_obb.py`)
+
+### `split_and_train_obb.py` — Split dataset and train YOLO OBB model
+
+Takes a YOLO-OBB annotated dataset (e.g. exported from CVAT), splits it into train/val sets, writes `data.yaml`, and optionally trains a YOLO OBB model.
+
+**Expected dataset layout:**
+```
+dataset/
+    images/       # .jpg / .png images
+    labels/       # matching .txt files in YOLO-OBB format
+    classes.txt   # one class name per line
+```
+
+**Split only (no training):**
+```bash
+python split_and_train_obb.py \
+    --dataset ./dataset \
+    --output  ./dataset_split \
+    --no-train
+```
+
+**Split + train:**
+```bash
+python split_and_train_obb.py \
+    --dataset ./dataset \
+    --output  ./dataset_split \
+    --model   yolo26n-obb.pt \
+    --epochs  100 \
+    --imgsz   1024 \
+    --batch   8 \
+    --device  0
+```
+
+**Train on an already-split dataset:**
+```bash
+python split_and_train_obb.py \
+    --dataset    ./dataset \
+    --output     ./dataset_split \
+    --skip-split \
+    --model      yolo26n-obb.pt
+```
+
+Key flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dataset` | *(required)* | Source dataset folder |
+| `--output` | `dataset_split` | Output folder for split data |
+| `--val-split` | `0.2` | Fraction of data used for validation |
+| `--model` | `yolo26n-obb.pt` | Base checkpoint to train from |
+| `--epochs` | `100` | Number of training epochs |
+| `--imgsz` | `1024` | Training image size |
+| `--batch` | `8` | Batch size |
+| `--device` | *(auto)* | `0` for GPU 0, `cpu` for CPU |
+| `--patience` | `50` | Early-stopping patience |
+| `--no-train` | off | Split only, skip training |
+| `--skip-split` | off | Skip splitting, go straight to training |
+| `--resume` | off | Resume the last training run |
+
+Trained weights are saved under `runs_obb/train/weights/best.pt`. Copy this to `ai_model/best.pt` to use with `detector.py`.
+
+---
+
+## Step 6 — Run Detection (`detector.py`)
+
+### `detector.py` — Run inference and produce 3D segmentations
+
+Processes every `.stl` file in the `dev/` folder end-to-end:
+
+1. Load and align the mesh
+2. Render top & bottom views
+3. Run YOLO inference to detect `ToothTop`, `ToothBottom`, and `Connector` regions
+4. Select the clean (non-bottom) view
+5. Unproject detections back into 3D using the depth buffer
+6. Crop matching point-cloud segments, color them, and render an overlay image
+
+```bash
+python detector.py
+```
+
+All outputs are written to `detections/<mesh_name>/`:
+
+| File | Description |
+|---|---|
+| `aligned.stl` | Mesh after principal-axis alignment |
+| `top.png` / `bottom.png` | Raw rendered views |
+| `inference_top.png` / `inference_bottom.png` | Annotated detection debug images |
+| `chosen_<view>.png` | The view selected for segmentation |
+| `overlay_top.png` | Final mesh + colored point-cloud overlay |
+
+Key configuration (edit at the top of the file):
+
+| Variable | Default | Description |
+|---|---|---|
+| `STL_DIR` | `dev` | Folder containing `.stl` files to process |
+| `OUTPUT_DIR` | `detections` | Root output folder |
+| `MODEL_PATH` | `ai_model/best.pt` | Trained YOLO detector |
+| `CONF_THRESHOLD` | `0.25` | Minimum detection confidence |
+| `SHOW_CONFIDENCE` | `False` | Show confidence scores on debug images |
+
+---
+
+## Typical End-to-End Workflow
+
+```
+stl/                      ← place raw STL files here
+  └─ ...
+
+1. python training_data_collection.py
+        → renders/        ← rendered images for annotation
+
+2. Annotate in Label Studio (YOLO-OBB format), export to dataset/
+
+3. python split_and_train_obb.py --dataset ./dataset --output ./dataset_split \
+       --model yolo26n-obb.pt --epochs 100 --device 0
+        → runs_obb/train/weights/best.pt
+
+4. cp runs_obb/train/weights/best.pt ai_model/best.pt
+
+5. Place STLs to detect in dev/
+   python detector.py
+        → detections/<mesh>/overlay_top.png
+```
