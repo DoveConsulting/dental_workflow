@@ -278,58 +278,96 @@ def select_valid_view(captures, detections_by_view, out_dir):
 
 
 # ── Step 7: pull the points inside each detection's 3D box ─────
-def unproject_bbox_to_xy(bbox, depth, eye, up, width, height, fov=FOV_DEG, margin_frac=0.02):
-    """Sample across a pixel bbox, unproject each hit using the matching
-    depth buffer, and return the resulting XY footprint in world/mesh
-    coordinates.
+def polygon_contains(points, polygon):
+    """Vectorized point-in-convex-polygon test (same-side/cross-product
+    method). Works for any winding order and any convex polygon (a 4-point
+    OBB quad, a plain rectangle, or a cv2.convexHull with more vertices).
 
-    Sample density scales with the box's own pixel size (~1 sample per
-    pixel, capped for speed) instead of a fixed grid — a fixed low-density
-    grid under-samples larger boxes, which leaves the computed XY range
-    narrower than the true surface footprint and silently drops real
-    points near the edges once points_in_box() crops against it. A small
-    proportional margin is added on top as extra insurance against the
-    same issue at the exact silhouette boundary.
+    points:  (N, 2) array
+    polygon: (M, 2) array, vertices in perimeter order
     """
+    points = np.asarray(points, dtype=float)
+    polygon = np.asarray(polygon, dtype=float)
+    n = len(polygon)
+
+    cross_vals = np.empty((points.shape[0], n))
+    for i in range(n):
+        a = polygon[i]
+        b = polygon[(i + 1) % n]
+        edge = b - a
+        to_point = points - a
+        cross_vals[:, i] = edge[0] * to_point[:, 1] - edge[1] * to_point[:, 0]
+
+    return (cross_vals >= -1e-9).all(axis=1) | (cross_vals <= 1e-9).all(axis=1)
+
+
+def scale_polygon(polygon, factor):
+    """Scale a polygon's vertices outward from its centroid — used to add a
+    small safety margin without losing the polygon's actual shape."""
+    polygon = np.asarray(polygon, dtype=float)
+    centroid = polygon.mean(axis=0)
+    return centroid + (polygon - centroid) * factor
+
+
+def unproject_bbox_footprint(det, depth, eye, up, width, height, fov=FOV_DEG, margin_frac=0.02):
+    """Unproject a detection's pixel-space box onto the mesh surface using
+    the rendered depth buffer, and return the resulting footprint as a
+    world-space polygon.
+
+    Sampling is restricted to pixels *inside* the detection's own polygon —
+    a rotated OBB quad if available, otherwise its plain rectangle — not
+    just its axis-aligned bounding box. Cropping against the enclosing
+    rectangle instead let rotated-box segments bleed into whatever
+    geometry happened to sit in the AABB's corners but outside the actual
+    box. Sample density scales with the box's own pixel size (~1 sample
+    per pixel, capped for speed).
+    """
+    pixel_polygon = det.get("obb_corners")
+    if pixel_polygon is None:
+        x1, y1, x2, y2 = det["bbox"]
+        pixel_polygon = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    pixel_polygon = np.asarray(pixel_polygon, dtype=float)
+
+    x1, y1 = pixel_polygon.min(axis=0)
+    x2, y2 = pixel_polygon.max(axis=0)
+    grid_x = int(np.clip(round(x2 - x1), 4, 200))
+    grid_y = int(np.clip(round(y2 - y1), 4, 200))
+
+    px_grid, py_grid = np.meshgrid(np.linspace(x1, x2, grid_x), np.linspace(y1, y2, grid_y))
+    sample_px = np.stack([px_grid.ravel(), py_grid.ravel()], axis=1)
+    sample_px = sample_px[polygon_contains(sample_px, pixel_polygon)]
+
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
     renderer.setup_camera(fov, np.array(CENTER), np.array(eye), np.array(up))
     camera = renderer.scene.camera
 
-    x1, y1, x2, y2 = bbox
-    grid_x = int(np.clip(round(x2 - x1), 4, 200))
-    grid_y = int(np.clip(round(y2 - y1), 4, 200))
-
     world_points = []
-    for py in np.linspace(y1, y2, grid_y):
-        for px in np.linspace(x1, x2, grid_x):
-            ix = int(np.clip(round(px), 0, width - 1))
-            iy = int(np.clip(round(py), 0, height - 1))
-            d = depth[iy, ix]
-            if d >= 1.0:  # no geometry hit at this pixel (background)
-                continue
-            world_points.append(camera.unproject(px, py, d, width, height))
+    for px, py in sample_px:
+        ix = int(np.clip(round(px), 0, width - 1))
+        iy = int(np.clip(round(py), 0, height - 1))
+        d = depth[iy, ix]
+        if d >= 1.0:  # no geometry hit at this pixel (background)
+            continue
+        world_points.append(camera.unproject(px, py, d, width, height))
 
     del renderer
-    if not world_points:
+    if len(world_points) < 3:
+        # Not enough surface hits to define a footprint (e.g. the box sat
+        # mostly over background, or was a sliver after the polygon
+        # filter) — cv2.convexHull needs at least 3 points.
         return None
 
-    world_points = np.array(world_points)
-    x_min, x_max = world_points[:, 0].min(), world_points[:, 0].max()
-    y_min, y_max = world_points[:, 1].min(), world_points[:, 1].max()
-
-    pad_x = (x_max - x_min) * margin_frac
-    pad_y = (y_max - y_min) * margin_frac
-    return x_min - pad_x, x_max + pad_x, y_min - pad_y, y_max + pad_y
-
-
-def points_in_box(points, x_range, y_range, z_half_height=BOX_HALF_HEIGHT):
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    return (
-        (points[:, 0] >= x_min) & (points[:, 0] <= x_max) &
-        (points[:, 1] >= y_min) & (points[:, 1] <= y_max) &
-        (points[:, 2] >= -z_half_height) & (points[:, 2] <= z_half_height)
+    world_xy = np.ascontiguousarray(
+        np.asarray(world_points, dtype=np.float64)[:, :2], dtype=np.float32
     )
+    hull = cv2.convexHull(world_xy).reshape(-1, 2)
+    return scale_polygon(hull, 1.0 + margin_frac)
+
+
+def points_in_box(points, footprint_polygon, z_half_height=BOX_HALF_HEIGHT):
+    xy_inside = polygon_contains(points[:, :2], footprint_polygon)
+    z_inside = (points[:, 2] >= -z_half_height) & (points[:, 2] <= z_half_height)
+    return xy_inside & z_inside
 
 
 def random_segment_color():
@@ -352,12 +390,11 @@ def segment_pointcloud(pcd, detections, view_capture):
         if det["label"] not in SEGMENT_LABELS:
             continue
 
-        xy = unproject_bbox_to_xy(det["bbox"], depth, eye, up, IMAGE_WIDTH, IMAGE_HEIGHT)
-        if xy is None:
+        footprint = unproject_bbox_footprint(det, depth, eye, up, IMAGE_WIDTH, IMAGE_HEIGHT)
+        if footprint is None:
             continue
-        x_min, x_max, y_min, y_max = xy
 
-        mask = points_in_box(points, (x_min, x_max), (y_min, y_max))
+        mask = points_in_box(points, footprint)
         if not mask.any():
             continue
 
