@@ -151,7 +151,7 @@ All project setup is done through the Label Studio web interface at
    saves the annotation and advances to the next task.
 7. Repeat for all images.
 
-<img src="labelStudio.png" alt="LabelStudio" width="50%"/>
+<img src="/media/labelStudio.png" alt="LabelStudio" width="50%"/>
 
 ### 4b. Review Annotations
 
@@ -252,6 +252,9 @@ Processes every `.stl` file in the `dev/` folder end-to-end:
 ```bash
 python detector.py
 ```
+
+<img src="/media/inference_top.png" alt="LabelStudio" width="50%"/><img src="/media/inference_bottom.png" alt="LabelStudio" width="50%"/>
+<img src="/media/overlay_top.png" alt="LabelStudio" width="100%"/>
 
 All outputs are written to `detections/<mesh_name>/`:
 
