@@ -9,7 +9,7 @@ import open3d as o3d
 from ultralytics import YOLO
 
 # ── Configuration ──────────────────────────────────────────────
-STL_DIR         = "stl_test"              # folder of .stl files to process (mirrors training_data_collection.py)
+STL_DIR         = "dev"              # folder of .stl files to process (mirrors training_data_collection.py)
 OUTPUT_DIR      = "detections"       # debug images + final overlays are written here
 MODEL_PATH      = "ai_model/best.pt"  # YOLO detector trained on ToothTop / ToothBottom / Connector
 IMAGE_WIDTH     = 1920
@@ -84,7 +84,7 @@ def align_to_principal_axes(mesh):
     return mesh
 
 
-def mesh_to_pointcloud(mesh, number_of_points=10_000):
+def mesh_to_pointcloud(mesh, number_of_points=40_000):
     """Convert a mesh to a point cloud by sampling points on its surface."""
     return mesh.sample_points_uniformly(number_of_points=number_of_points)
 
@@ -278,18 +278,30 @@ def select_valid_view(captures, detections_by_view, out_dir):
 
 
 # ── Step 7: pull the points inside each detection's 3D box ─────
-def unproject_bbox_to_xy(bbox, depth, eye, up, width, height, fov=FOV_DEG, grid=6):
-    """Sample points across a pixel bbox, unproject each hit using the
-    matching depth buffer, and return the resulting XY footprint in
-    world/mesh coordinates."""
+def unproject_bbox_to_xy(bbox, depth, eye, up, width, height, fov=FOV_DEG, margin_frac=0.02):
+    """Sample across a pixel bbox, unproject each hit using the matching
+    depth buffer, and return the resulting XY footprint in world/mesh
+    coordinates.
+
+    Sample density scales with the box's own pixel size (~1 sample per
+    pixel, capped for speed) instead of a fixed grid — a fixed low-density
+    grid under-samples larger boxes, which leaves the computed XY range
+    narrower than the true surface footprint and silently drops real
+    points near the edges once points_in_box() crops against it. A small
+    proportional margin is added on top as extra insurance against the
+    same issue at the exact silhouette boundary.
+    """
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
     renderer.setup_camera(fov, np.array(CENTER), np.array(eye), np.array(up))
     camera = renderer.scene.camera
 
     x1, y1, x2, y2 = bbox
+    grid_x = int(np.clip(round(x2 - x1), 4, 200))
+    grid_y = int(np.clip(round(y2 - y1), 4, 200))
+
     world_points = []
-    for py in np.linspace(y1, y2, grid):
-        for px in np.linspace(x1, x2, grid):
+    for py in np.linspace(y1, y2, grid_y):
+        for px in np.linspace(x1, x2, grid_x):
             ix = int(np.clip(round(px), 0, width - 1))
             iy = int(np.clip(round(py), 0, height - 1))
             d = depth[iy, ix]
@@ -302,10 +314,12 @@ def unproject_bbox_to_xy(bbox, depth, eye, up, width, height, fov=FOV_DEG, grid=
         return None
 
     world_points = np.array(world_points)
-    return (
-        world_points[:, 0].min(), world_points[:, 0].max(),
-        world_points[:, 1].min(), world_points[:, 1].max(),
-    )
+    x_min, x_max = world_points[:, 0].min(), world_points[:, 0].max()
+    y_min, y_max = world_points[:, 1].min(), world_points[:, 1].max()
+
+    pad_x = (x_max - x_min) * margin_frac
+    pad_y = (y_max - y_min) * margin_frac
+    return x_min - pad_x, x_max + pad_x, y_min - pad_y, y_max + pad_y
 
 
 def points_in_box(points, x_range, y_range, z_half_height=BOX_HALF_HEIGHT):
@@ -362,8 +376,8 @@ def capture_overlay_view(mesh, segments, out_dir):
  
     views = {
         "top":       {"eye": [0, 0,  radius], "up": [0, 1, 0]},
-        "bottom":    {"eye": [0, 0, -radius], "up": [0, 1, 0]},
-        "isometric": {"eye": [radius * 0.7, -radius * 0.7, radius * 0.7], "up": [0, 0, 1]},
+        # "bottom":    {"eye": [0, 0, -radius], "up": [0, 1, 0]},
+        # "isometric": {"eye": [radius * 0.7, -radius * 0.7, radius * 0.7], "up": [0, 0, 1]},
     }
  
     renderer = o3d.visualization.rendering.OffscreenRenderer(IMAGE_WIDTH, IMAGE_HEIGHT)
