@@ -276,37 +276,66 @@ def find_connectors(
     return groups
 
 
-def make_connectors_geometry(connector_groups: list[list[dict]]) -> list[o3d.geometry.TriangleMesh]:
-    """Render each connector group as a green box spanning from the first
-    plane's corners to the last plane's corners."""
-    boxes = []
+def make_connectors_geometry(
+    mesh: trimesh.Trimesh,
+    connector_groups: list[list[dict]],
+    num_samples: int = 5000,
+) -> o3d.geometry.PointCloud:
+    """Sample points on the mesh within each connector region and return
+    them as a green point cloud."""
+    # For each connector group, define the slab between first and last plane
+    connector_points = []
     for group in connector_groups:
-        front = group[0]["corners"]   # 4 corners of first plane
-        back = group[-1]["corners"]   # 4 corners of last plane
+        origin_first = group[0]["origin"]
+        normal_first = group[0]["normal"]
+        origin_last = group[-1]["origin"]
+        normal_last = group[-1]["normal"]
 
-        # 8 vertices: front face (0-3), back face (4-7)
-        verts = np.vstack([front, back])
+        # A vertex is inside this slab if it's between the two bounding planes
+        # (on the positive side of the first plane and negative side of the last)
+        d_first = mesh.vertices @ normal_first - origin_first @ normal_first
+        d_last = mesh.vertices @ normal_last - origin_last @ normal_last
 
-        # 6 faces × 2 triangles each = 12 triangles
-        tris = [
-            # front face
-            [0, 1, 2], [0, 2, 3],
-            # back face
-            [4, 6, 5], [4, 7, 6],
-            # side faces
-            [0, 4, 5], [0, 5, 1],
-            [1, 5, 6], [1, 6, 2],
-            [2, 6, 7], [2, 7, 3],
-            [3, 7, 4], [3, 4, 0],
-        ]
+        # Vertices between the two planes
+        inside = (d_first >= 0) & (d_last <= 0)
+        if not inside.any():
+            # Try flipping
+            inside = (d_first <= 0) & (d_last >= 0)
 
-        box = o3d.geometry.TriangleMesh()
-        box.vertices = o3d.utility.Vector3dVector(verts)
-        box.triangles = o3d.utility.Vector3iVector(tris)
-        box.paint_uniform_color([0.0, 1.0, 0.3])
-        box.compute_vertex_normals()
-        boxes.append(box)
-    return boxes
+        if inside.any():
+            connector_points.append(mesh.vertices[inside])
+
+    if not connector_points:
+        pcd = o3d.geometry.PointCloud()
+        return pcd
+
+    all_pts = np.vstack(connector_points)
+
+    # Also sample surface points in connector regions for denser coverage
+    sampled, face_idx = trimesh.sample.sample_surface(mesh, num_samples)
+    # Filter sampled points to those within any connector slab
+    keep = np.zeros(len(sampled), dtype=bool)
+    for group in connector_groups:
+        origin_first = group[0]["origin"]
+        normal_first = group[0]["normal"]
+        origin_last = group[-1]["origin"]
+        normal_last = group[-1]["normal"]
+
+        d_first = sampled @ normal_first - origin_first @ normal_first
+        d_last = sampled @ normal_last - origin_last @ normal_last
+
+        slab = (d_first >= 0) & (d_last <= 0)
+        if not slab.any():
+            slab = (d_first <= 0) & (d_last >= 0)
+        keep |= slab
+
+    if keep.any():
+        all_pts = np.vstack([all_pts, sampled[keep]])
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(all_pts)
+    pcd.paint_uniform_color([0.0, 1.0, 0.3])
+    return pcd
 
 
 # ── 6. Render with Open3D ─────────────────────────────────────────────────
@@ -460,7 +489,7 @@ def main():
     # if "planes" in args.show:
     #     items.append(make_planes_geometry(planes))
     if connectors:
-        items.append(make_connectors_geometry(connectors))
+        items.append(make_connectors_geometry(mesh, connectors))
     render(*items)
 
 
