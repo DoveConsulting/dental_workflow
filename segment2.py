@@ -128,6 +128,22 @@ def fit_occlusal_curve(
     # Transform back to world XY
     world_xy = centroid_2d + np.outer(u_fine, axis_u) + np.outer(v_fine, axis_v)
     curve = np.column_stack([world_xy, np.zeros(num_eval)])
+
+    # Trim curve to mesh extents
+    if mesh_vertices is not None:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(mesh_vertices[:, :2])
+        from scipy.spatial import Delaunay
+        hull_del = Delaunay(mesh_vertices[hull.vertices, :2])
+        inside = hull_del.find_simplex(curve[:, :2]) >= 0
+        # Keep the longest contiguous run of inside points
+        if inside.any():
+            diffs = np.diff(np.concatenate([[0], inside.astype(int), [0]]))
+            starts = np.where(diffs == 1)[0]
+            ends = np.where(diffs == -1)[0]
+            lengths = ends - starts
+            best = np.argmax(lengths)
+            curve = curve[starts[best]:ends[best]]
     return curve
 
 
