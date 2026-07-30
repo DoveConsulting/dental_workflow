@@ -212,6 +212,53 @@ def create_slicing_planes(
     return planes
 
 
+# ── 5b. Connector detection ──────────────────────────────────────────────
+
+def find_connectors(
+    mesh: trimesh.Trimesh,
+    planes: list[dict],
+    threshold_ratio: float = 0.8,
+) -> list[dict]:
+    """Identify connector regions: planes where the Z-extent of the
+    mesh/plane intersection is below *threshold_ratio* × median Z-extent.
+
+    Returns the subset of *planes* classified as connectors.
+    """
+    z_extents = []
+    for pl in planes:
+        section = mesh.section(
+            plane_origin=pl["origin"],
+            plane_normal=pl["normal"],
+        )
+        if section is None:
+            z_extents.append(0.0)
+            continue
+        verts = section.vertices
+        z_extent = verts[:, 2].max() - verts[:, 2].min()
+        z_extents.append(z_extent)
+
+    z_extents = np.array(z_extents)
+    median_z = np.median(z_extents[z_extents > 0]) if np.any(z_extents > 0) else 1.0
+    threshold = threshold_ratio * median_z
+
+    connectors = [pl for pl, ze in zip(planes, z_extents) if 0 < ze < threshold]
+    return connectors
+
+
+def make_connectors_geometry(connectors: list[dict]) -> list[o3d.geometry.TriangleMesh]:
+    """Render connector planes as green quads."""
+    quads = []
+    for pl in connectors:
+        c = pl["corners"]
+        quad = o3d.geometry.TriangleMesh()
+        quad.vertices = o3d.utility.Vector3dVector(c)
+        quad.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [0, 2, 3]])
+        quad.paint_uniform_color([0.0, 1.0, 0.3])
+        quad.compute_vertex_normals()
+        quads.append(quad)
+    return quads
+
+
 # ── 6. Render with Open3D ─────────────────────────────────────────────────
 
 def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
@@ -350,14 +397,20 @@ def main():
                                    plane_half_size=args.plane_size)
     print(f"  → {len(planes)} planes")
 
+    print("Detecting connectors …")
+    connectors = find_connectors(mesh, planes)
+    print(f"  → {len(connectors)} connector planes detected")
+
     print("Rendering …")
     items = []
     if "mesh" in args.show:
         items.append(make_mesh_geometry(mesh, wireframe=args.wireframe))
     if "curve" in args.show:
         items.append(make_curve_geometry(curve))
-    if "planes" in args.show:
-        items.append(make_planes_geometry(planes))
+    # if "planes" in args.show:
+    #     items.append(make_planes_geometry(planes))
+    if connectors:
+        items.append(make_connectors_geometry(connectors))
     render(*items)
 
 
