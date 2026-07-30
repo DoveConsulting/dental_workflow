@@ -29,10 +29,12 @@ Usage:
 """
 
 import argparse
+import colorsys
 import os
 from pathlib import Path
 
 import numpy as np
+import open3d as o3d
 import trimesh
 import networkx as nx
 from scipy import ndimage
@@ -287,6 +289,133 @@ def save_components(
 
 
 # ---------------------------------------------------------------------------
+# Visualization: colored point cloud snapshots
+# ---------------------------------------------------------------------------
+
+def _generate_distinct_colors(n: int) -> list[tuple[float, float, float]]:
+    """Generate *n* visually distinguishable colours (maximally spaced hues)."""
+    colors = []
+    for i in range(n):
+        hue = i / n
+        # High saturation + value for vivid colours on black background
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.9, 0.95)
+        colors.append((r, g, b))
+    return colors
+
+
+def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
+    o3d_mesh = o3d.geometry.TriangleMesh()
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+    o3d_mesh.compute_vertex_normals()
+    return o3d_mesh
+
+
+def snapshot_components(
+    original_mesh: trimesh.Trimesh,
+    components: list[trimesh.Trimesh],
+    output_dir: str,
+    base_name: str,
+    image_width: int = 1920,
+    image_height: int = 1080,
+    point_density: int = 5000,
+) -> list[str]:
+    """
+    Build a coloured point cloud (one colour per component) overlaid on the
+    semi-transparent original mesh, then render snapshots from multiple
+    viewpoints over a black background.
+
+    Returns the list of saved image paths.
+    """
+    snap_dir = os.path.join(output_dir, base_name, "snapshots")
+    os.makedirs(snap_dir, exist_ok=True)
+
+    # --- build original mesh (dark grey, semi-transparent wireframe look) ---
+    o3d_original = _trimesh_to_o3d(original_mesh)
+    o3d_original.paint_uniform_color([1.0, 1.0, 1.0])
+
+    # --- build coloured point cloud from components ---
+    colors = _generate_distinct_colors(len(components))
+    all_points = []
+    all_colors = []
+
+    for comp, color in zip(components, colors):
+        n_samples = max(200, int(point_density * (comp.area / original_mesh.area)))
+        pts, _ = trimesh.sample.sample_surface(comp, n_samples)
+        all_points.append(pts)
+        all_colors.append(np.tile(color, (len(pts), 1)))
+
+    combined_pts = np.vstack(all_points)
+    combined_colors = np.vstack(all_colors)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(combined_pts)
+    pcd.colors = o3d.utility.Vector3dVector(combined_colors)
+
+    # --- camera setup ---
+    center = original_mesh.centroid
+    scale = original_mesh.scale
+    distance = scale * 1.6
+
+    # Multiple viewpoints: front, back, left, right, top, bottom, 3/4 views
+    views = {
+        "front":       (0, 0, distance),
+        "back":        (0, 0, -distance),
+        "left":        (-distance, 0, 0),
+        "right":       (distance, 0, 0),
+        "top":         (0, distance, 0),
+        "bottom":      (0, -distance, 0),
+        "front_left":  (-distance * 0.7, distance * 0.5, distance * 0.7),
+        "front_right": (distance * 0.7, distance * 0.5, distance * 0.7),
+    }
+
+    saved_paths = []
+
+    renderer = o3d.visualization.rendering.OffscreenRenderer(
+        image_width, image_height
+    )
+    renderer.scene.set_background([0.0, 0.0, 0.0, 1.0])  # black
+
+    # Material for mesh
+    mesh_mat = o3d.visualization.rendering.MaterialRecord()
+    mesh_mat.shader = "defaultLitTransparency"
+    mesh_mat.base_color = [1.0, 1.0, 1.0, 0.35]
+
+    # Material for point cloud
+    pcd_mat = o3d.visualization.rendering.MaterialRecord()
+    pcd_mat.shader = "defaultUnlit"
+    pcd_mat.point_size = 3.0
+
+    renderer.scene.add_geometry("original_mesh", o3d_original, mesh_mat)
+    renderer.scene.add_geometry("point_cloud", pcd, pcd_mat)
+
+    # Lighting
+    renderer.scene.scene.enable_sun_light(True)
+    renderer.scene.scene.set_sun_light(
+        [0.5, -1.0, -0.5], [1.0, 1.0, 1.0], 60000
+    )
+
+    for view_name, eye_offset in views.items():
+        eye = center + np.array(eye_offset)
+        up = np.array([0.0, 1.0, 0.0])
+        # Avoid degenerate up vector for top/bottom views
+        if view_name == "top":
+            up = np.array([0.0, 0.0, -1.0])
+        elif view_name == "bottom":
+            up = np.array([0.0, 0.0, 1.0])
+
+        renderer.setup_camera(60.0, center, eye, up)
+
+        img = renderer.render_to_image()
+        out_path = os.path.join(snap_dir, f"{base_name}_{view_name}.png")
+        o3d.io.write_image(out_path, img)
+        saved_paths.append(out_path)
+        print(f"  Snapshot: {out_path}")
+
+    return saved_paths
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -338,10 +467,15 @@ def segment(
     teeth_dir = os.path.join(output_dir, base, "teeth")
     conn_dir = os.path.join(output_dir, base, "connectors")
 
-    if teeth:
-        save_components(teeth, teeth_dir, f"{base}_tooth")
-    if connectors:
-        save_components(connectors, conn_dir, f"{base}_connector")
+    # if teeth:
+    #     save_components(teeth, teeth_dir, f"{base}_tooth")
+    # if connectors:
+    #     save_components(connectors, conn_dir, f"{base}_connector")
+
+    # Render coloured point-cloud snapshots
+    print("  Rendering snapshots …")
+    # snapshot_components(mesh, components, output_dir, base)
+    snapshot_components(mesh, connectors, output_dir, base)
 
     print("Done.\n")
 
