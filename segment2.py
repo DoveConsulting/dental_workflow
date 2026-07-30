@@ -218,11 +218,13 @@ def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
     threshold_ratio: float = 0.8,
-) -> list[dict]:
-    """Identify connector regions: planes where the Z-extent of the
-    mesh/plane intersection is below *threshold_ratio* × median Z-extent.
+) -> list[list[dict]]:
+    """Identify connector regions: consecutive runs of planes where the
+    Z-extent of the mesh/plane intersection falls below
+    *threshold_ratio* × median Z-extent.
 
-    Returns the subset of *planes* classified as connectors.
+    Returns a list of connector groups, each group being a list of
+    consecutive planes that form one connector region.
     """
     z_extents = []
     for pl in planes:
@@ -241,22 +243,54 @@ def find_connectors(
     median_z = np.median(z_extents[z_extents > 0]) if np.any(z_extents > 0) else 1.0
     threshold = threshold_ratio * median_z
 
-    connectors = [pl for pl, ze in zip(planes, z_extents) if 0 < ze < threshold]
-    return connectors
+    # Find connector plane indices and group consecutive runs
+    is_connector = [(0 < ze < threshold) for ze in z_extents]
+    groups: list[list[dict]] = []
+    current_group: list[dict] = []
+    for i, flag in enumerate(is_connector):
+        if flag:
+            current_group.append(planes[i])
+        else:
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+    if current_group:
+        groups.append(current_group)
+
+    return groups
 
 
-def make_connectors_geometry(connectors: list[dict]) -> list[o3d.geometry.TriangleMesh]:
-    """Render connector planes as green quads."""
-    quads = []
-    for pl in connectors:
-        c = pl["corners"]
-        quad = o3d.geometry.TriangleMesh()
-        quad.vertices = o3d.utility.Vector3dVector(c)
-        quad.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [0, 2, 3]])
-        quad.paint_uniform_color([0.0, 1.0, 0.3])
-        quad.compute_vertex_normals()
-        quads.append(quad)
-    return quads
+def make_connectors_geometry(connector_groups: list[list[dict]]) -> list[o3d.geometry.TriangleMesh]:
+    """Render each connector group as a green box spanning from the first
+    plane's corners to the last plane's corners."""
+    boxes = []
+    for group in connector_groups:
+        front = group[0]["corners"]   # 4 corners of first plane
+        back = group[-1]["corners"]   # 4 corners of last plane
+
+        # 8 vertices: front face (0-3), back face (4-7)
+        verts = np.vstack([front, back])
+
+        # 6 faces × 2 triangles each = 12 triangles
+        tris = [
+            # front face
+            [0, 1, 2], [0, 2, 3],
+            # back face
+            [4, 6, 5], [4, 7, 6],
+            # side faces
+            [0, 4, 5], [0, 5, 1],
+            [1, 5, 6], [1, 6, 2],
+            [2, 6, 7], [2, 7, 3],
+            [3, 7, 4], [3, 4, 0],
+        ]
+
+        box = o3d.geometry.TriangleMesh()
+        box.vertices = o3d.utility.Vector3dVector(verts)
+        box.triangles = o3d.utility.Vector3iVector(tris)
+        box.paint_uniform_color([0.0, 1.0, 0.3])
+        box.compute_vertex_normals()
+        boxes.append(box)
+    return boxes
 
 
 # ── 6. Render with Open3D ─────────────────────────────────────────────────
