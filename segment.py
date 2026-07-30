@@ -37,8 +37,6 @@ import numpy as np
 import open3d as o3d
 import trimesh
 import networkx as nx
-from scipy import ndimage
-from scipy.spatial import cKDTree
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +127,38 @@ def segment_by_curvature(
 
 
 # ---------------------------------------------------------------------------
-# Voxel morphological segmentation (fallback)
+# Ray-cast thickness segmentation (fallback / alternative to curvature)
 # ---------------------------------------------------------------------------
+
+def _compute_local_thickness(mesh: trimesh.Trimesh) -> np.ndarray:
+    """
+    For each vertex, cast a ray inward (along -normal) and measure the
+    distance to the first intersection with the opposite wall.  This gives
+    the local structural diameter of the mesh at that point.
+
+    Teeth (bulky) → large thickness.
+    Connectors (thin bars) → small thickness.
+    """
+    origins = mesh.vertices.copy()
+    directions = -mesh.vertex_normals.copy()
+
+    # Offset origins slightly along the normal to avoid self-intersection
+    origins += directions * (mesh.scale * 1e-4)
+
+    locations, index_ray, _ = mesh.ray.intersects_location(
+        ray_origins=origins,
+        ray_directions=directions,
+        multiple_hits=False,
+    )
+
+    thickness = np.zeros(len(mesh.vertices), dtype=float)
+    for loc, ri in zip(locations, index_ray):
+        d = np.linalg.norm(loc - mesh.vertices[ri])
+        if d > mesh.scale * 0.001:  # skip near-self hits
+            thickness[ri] = d
+
+    return thickness
+
 
 def segment_by_voxel_morphology(
     mesh: trimesh.Trimesh,
@@ -139,71 +167,65 @@ def segment_by_voxel_morphology(
     min_component_faces: int = 50,
 ) -> list[trimesh.Trimesh]:
     """
-    Voxelize → EDT → threshold to find tooth cores → label → watershed
-    expand → map labels back to mesh vertices.
+    Ray-cast thickness segmentation.
+
+    For each vertex, cast a ray inward and measure the local structural
+    diameter.  Connector vertices have small thickness (thin bars); tooth
+    vertices have large thickness.  Vertices below a thickness percentile
+    are treated as boundary vertices and removed from the face-adjacency
+    graph, yielding connected components (same logic as the curvature
+    method but using a different geometric criterion).
     """
-    if voxel_size is None:
-        voxel_size = mesh.scale * 0.005  # ~200 voxels along longest axis
+    thickness = _compute_local_thickness(mesh)
 
-    # Voxelize
-    voxel_grid = mesh.voxelized(voxel_size)
-    matrix = voxel_grid.matrix.astype(bool)
-
-    # Euclidean distance transform (distance to nearest background voxel)
-    edt = ndimage.distance_transform_edt(matrix)
-
-    # Erode: only keep voxels far from the surface (tooth cores survive)
-    erode_threshold = np.percentile(edt[matrix], 60)
-    seeds = edt > erode_threshold
-
-    # Label the surviving seed regions
-    labelled_seeds, num_seeds = ndimage.label(seeds)
-
-    if num_seeds < 2:
-        # Try more aggressive threshold
-        erode_threshold = np.percentile(edt[matrix], 75)
-        seeds = edt > erode_threshold
-        labelled_seeds, num_seeds = ndimage.label(seeds)
-
-    if num_seeds < 2:
+    # Vertices with zero thickness = ray missed; assign median
+    valid = thickness[thickness > 0]
+    if len(valid) == 0:
         return []
+    thickness[thickness == 0] = np.median(valid)
 
-    # Watershed-like expansion: iteratively dilate seeds into occupied space
-    labels = labelled_seeds.copy()
-    max_iter = int(np.max(edt)) + 10
-    for _ in range(max_iter):
-        dilated = ndimage.grey_dilation(labels, size=3)
-        expand_mask = (labels == 0) & matrix
-        labels[expand_mask] = dilated[expand_mask]
-        if not np.any((labels == 0) & matrix):
-            break
+    # Smooth thickness over vertex neighbours to reduce noise
+    smoothed = thickness.copy()
+    from collections import defaultdict
+    vert_adj = defaultdict(set)
+    for f in mesh.faces:
+        vert_adj[int(f[0])].update([int(f[1]), int(f[2])])
+        vert_adj[int(f[1])].update([int(f[0]), int(f[2])])
+        vert_adj[int(f[2])].update([int(f[0]), int(f[1])])
+    for vi in range(len(mesh.vertices)):
+        nbrs = vert_adj[vi]
+        if nbrs:
+            smoothed[vi] = 0.5 * thickness[vi] + 0.5 * np.mean(thickness[list(nbrs)])
 
-    # Map voxel labels back to mesh vertices via nearest filled voxel
-    filled_coords = np.argwhere(matrix)
-    label_values = labels[matrix]
+    # Connector boundary = vertices with low thickness (bottom percentile)
+    threshold = np.percentile(smoothed, 8.0)
+    boundary_verts = set(np.where(smoothed < threshold)[0])
 
-    if len(filled_coords) == 0:
-        return []
+    # Build face adjacency graph excluding boundary faces
+    faces = mesh.faces
+    num_faces = len(faces)
 
-    # Convert voxel indices to world coordinates
-    voxel_origin = voxel_grid.transform[:3, 3]
-    filled_world = filled_coords * voxel_size + voxel_origin
-    tree = cKDTree(filled_world)
-    _, indices = tree.query(mesh.vertices)
+    boundary_faces = set()
+    for fi in range(num_faces):
+        if any(int(v) in boundary_verts for v in faces[fi]):
+            boundary_faces.add(fi)
 
-    vertex_labels = label_values[indices]
+    face_graph = nx.Graph()
+    for fi in range(num_faces):
+        if fi not in boundary_faces:
+            face_graph.add_node(fi)
 
-    # Extract submeshes per label
+    for pair in mesh.face_adjacency:
+        f0, f1 = int(pair[0]), int(pair[1])
+        if f0 not in boundary_faces and f1 not in boundary_faces:
+            face_graph.add_edge(f0, f1)
+
+    # Extract connected components
     components = []
-    for label_id in range(1, num_seeds + 1):
-        verts_in_label = set(np.where(vertex_labels == label_id)[0])
-        face_mask = np.array([
-            all(int(v) in verts_in_label for v in face)
-            for face in mesh.faces
-        ])
-        if face_mask.sum() < min_component_faces:
+    for cc in nx.connected_components(face_graph):
+        if len(cc) < min_component_faces:
             continue
-        face_indices = np.where(face_mask)[0]
+        face_indices = np.array(sorted(cc))
         submesh = mesh.submesh([face_indices], append=True)
         if submesh is not None and len(submesh.faces) > 0:
             components.append(submesh)
