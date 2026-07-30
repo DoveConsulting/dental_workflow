@@ -214,19 +214,61 @@ def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     o3d_mesh.compute_vertex_normals()
     return o3d_mesh
 
-def make_mesh_geometry(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
+def make_mesh_geometry(mesh: trimesh.Trimesh, wireframe: bool = False):
+    """Return the mesh as a solid white surface or a wireframe."""
     o3d_mesh = _trimesh_to_o3d(mesh)
-    o3d_mesh.paint_uniform_color([0.8, 0.8, 0.8])
+    if wireframe:
+        wf = o3d.geometry.LineSet.create_from_triangle_mesh(o3d_mesh)
+        wf.paint_uniform_color([0.75, 0.75, 0.75])
+        return wf
+    o3d_mesh.paint_uniform_color([1.0, 1.0, 1.0])
     return o3d_mesh
 
-def make_curve_geometry(curve: np.ndarray) -> o3d.geometry.LineSet:
-    n = len(curve)
-    lines = [[i, i + 1] for i in range(n - 1)]
-    ls = o3d.geometry.LineSet()
-    ls.points = o3d.utility.Vector3dVector(curve)
-    ls.lines = o3d.utility.Vector2iVector(lines)
-    ls.paint_uniform_color([0.0, 0.3, 1.0])
-    return ls
+def make_curve_geometry(curve: np.ndarray, radius: float = 0.15) -> o3d.geometry.TriangleMesh:
+    """Return the curve as a tube mesh so it renders with visible thickness."""
+    circle_res = 12
+    theta = np.linspace(0, 2 * np.pi, circle_res, endpoint=False)
+
+    all_verts = []
+    all_tris = []
+
+    for i in range(len(curve) - 1):
+        p0, p1 = curve[i], curve[i + 1]
+        tangent = p1 - p0
+        length = np.linalg.norm(tangent)
+        if length < 1e-12:
+            continue
+        tangent /= length
+
+        up = np.array([0.0, 0.0, 1.0])
+        perp = np.cross(up, tangent)
+        pn = np.linalg.norm(perp)
+        if pn < 1e-6:
+            up = np.array([0.0, 1.0, 0.0])
+            perp = np.cross(up, tangent)
+            pn = np.linalg.norm(perp)
+        perp /= pn
+        binorm = np.cross(tangent, perp)
+
+        ring0 = p0 + radius * (np.cos(theta)[:, None] * perp + np.sin(theta)[:, None] * binorm)
+        ring1 = p1 + radius * (np.cos(theta)[:, None] * perp + np.sin(theta)[:, None] * binorm)
+
+        base = len(all_verts)
+        all_verts.extend(ring0)
+        all_verts.extend(ring1)
+        for j in range(circle_res):
+            j1 = (j + 1) % circle_res
+            v0, v1 = base + j, base + j1
+            v2, v3 = base + circle_res + j, base + circle_res + j1
+            all_tris.append([v0, v2, v1])
+            all_tris.append([v1, v2, v3])
+
+    tube = o3d.geometry.TriangleMesh()
+    tube.vertices = o3d.utility.Vector3dVector(np.array(all_verts))
+    tube.triangles = o3d.utility.Vector3iVector(np.array(all_tris))
+    tube.paint_uniform_color([0.0, 0.3, 1.0])
+    tube.compute_vertex_normals()
+    return tube
 
 def make_planes_geometry(planes: list[dict]) -> list[o3d.geometry.TriangleMesh]:
     quads = []
@@ -241,7 +283,7 @@ def make_planes_geometry(planes: list[dict]) -> list[o3d.geometry.TriangleMesh]:
     return quads
 
 def render(*geometries) -> None:
-    """Render any number of Open3D geometry objects."""
+    """Render any number of Open3D geometry objects with transparency support."""
     flat = []
     for g in geometries:
         if isinstance(g, list):
@@ -253,12 +295,18 @@ def render(*geometries) -> None:
         print("Nothing to render.")
         return
 
-    o3d.visualization.draw_geometries(
-        flat,
-        window_name="Occlusal Plane Slicing",
-        width=1280,
-        height=800,
-    )
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Occlusal Plane Slicing", width=1280, height=800)
+
+    for g in flat:
+        vis.add_geometry(g)
+
+    opt = vis.get_render_option()
+    opt.mesh_show_back_face = True
+    opt.background_color = np.array([0.0, 0.0, 0.0])
+
+    vis.run()
+    vis.destroy_window()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
@@ -273,6 +321,8 @@ def main():
     parser.add_argument("--show", nargs="+", default=["mesh", "curve", "planes"],
                         choices=["mesh", "curve", "planes"],
                         help="Items to render (default: mesh curve planes)")
+    parser.add_argument("--wireframe", action="store_true",
+                        help="Render mesh as wireframe instead of solid")
     args = parser.parse_args()
 
     print(f"Loading {args.stl} …")
@@ -296,7 +346,7 @@ def main():
     print("Rendering …")
     items = []
     if "mesh" in args.show:
-        items.append(make_mesh_geometry(mesh))
+        items.append(make_mesh_geometry(mesh, wireframe=args.wireframe))
     if "curve" in args.show:
         items.append(make_curve_geometry(curve))
     # if "planes" in args.show:
