@@ -86,13 +86,14 @@ def slice_at_z0(mesh: trimesh.Trimesh) -> np.ndarray:
 
 def fit_occlusal_curve(
     pts: np.ndarray,
+    mesh_vertices: np.ndarray | None = None,
     num_eval: int = 500,
 ) -> np.ndarray:
     """Fit a parabolic arch through the cross-section centroids *pts*
     and return *num_eval* evenly sampled points (Nx3).
 
-    The curve is guaranteed to have a single extremum (no wiggles)
-    because it is a degree-2 polynomial in the arch's principal frame.
+    If *mesh_vertices* is provided the curve is extended to span the full
+    mesh extent along the arch axis, otherwise it only covers the centroids.
     """
     xy = pts[:, :2]
     centroid_2d = xy.mean(axis=0)
@@ -113,8 +114,14 @@ def fit_occlusal_curve(
     # Fit parabola: v = a*u² + b*u + c  →  single extremum
     coeffs = np.polyfit(u_coords, v_coords, 2)
 
-    # Sample uniformly along u
-    u_min, u_max = u_coords.min(), u_coords.max()
+    # Determine u range — use mesh extent if available
+    if mesh_vertices is not None:
+        mesh_xy_c = mesh_vertices[:, :2] - centroid_2d
+        mesh_u = mesh_xy_c @ axis_u
+        u_min, u_max = mesh_u.min(), mesh_u.max()
+    else:
+        u_min, u_max = u_coords.min(), u_coords.max()
+
     u_fine = np.linspace(u_min, u_max, num_eval)
     v_fine = np.polyval(coeffs, u_fine)
 
@@ -336,7 +343,7 @@ def main():
     print(f"  → {len(pts)} intersection points")
 
     print("Fitting occlusal curve …")
-    curve = fit_occlusal_curve(pts)
+    curve = fit_occlusal_curve(pts, mesh_vertices=mesh.vertices)
 
     print(f"Creating slicing planes (every {args.spacing} mm) …")
     planes = create_slicing_planes(curve, spacing_mm=args.spacing,
@@ -349,8 +356,8 @@ def main():
         items.append(make_mesh_geometry(mesh, wireframe=args.wireframe))
     if "curve" in args.show:
         items.append(make_curve_geometry(curve))
-    # if "planes" in args.show:
-    #     items.append(make_planes_geometry(planes))
+    if "planes" in args.show:
+        items.append(make_planes_geometry(planes))
     render(*items)
 
 
