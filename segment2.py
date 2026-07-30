@@ -233,11 +233,16 @@ def create_slicing_planes(
 def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
-    threshold_ratio: float = 0.8,
+    threshold_ratio: float = 0.7,
+    skip_extremes: bool = True,
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
     Z-extent of the mesh/plane intersection falls below
     *threshold_ratio* × median Z-extent.
+
+    If *skip_extremes* is True, connector groups that touch the first or
+    last plane are discarded (they are typically mesh boundary artifacts,
+    not real connectors).
 
     Returns a list of connector groups, each group being a list of
     consecutive planes that form one connector region.
@@ -262,10 +267,10 @@ def find_connectors(
     # Find connector plane indices and group consecutive runs
     is_connector = [(0 < ze < threshold) for ze in z_extents]
     groups: list[list[dict]] = []
-    current_group: list[dict] = []
+    current_group: list[int] = []
     for i, flag in enumerate(is_connector):
         if flag:
-            current_group.append(planes[i])
+            current_group.append(i)
         else:
             if current_group:
                 groups.append(current_group)
@@ -273,7 +278,12 @@ def find_connectors(
     if current_group:
         groups.append(current_group)
 
-    return groups
+    if skip_extremes:
+        n = len(planes)
+        groups = [g for g in groups if g[0] != 0 and g[-1] != n - 1]
+
+    # Convert index groups to plane groups
+    return [[planes[i] for i in g] for g in groups]
 
 
 def make_connectors_geometry(
@@ -456,6 +466,8 @@ def main():
                         help="Items to render (default: mesh curve planes)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
+    parser.add_argument("--keep-extremes", action="store_true",
+                        help="Include connector regions at the mesh extremes")
     args = parser.parse_args()
 
     print(f"Loading {args.stl} …")
@@ -477,8 +489,8 @@ def main():
     print(f"  → {len(planes)} planes")
 
     print("Detecting connectors …")
-    connectors = find_connectors(mesh, planes)
-    print(f"  → {len(connectors)} connector planes detected")
+    connectors = find_connectors(mesh, planes, skip_extremes=not args.keep_extremes)
+    print(f"  → {len(connectors)} connector regions detected")
 
     print("Rendering …")
     items = []
