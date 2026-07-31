@@ -10,21 +10,20 @@ Dental STL — Occlusal-plane slicing
 6. Render mesh + slicing planes with Open3D
 
 Usage:
-    python segment.py stl/0325.stl
-    python segment.py stl/0325.stl --spacing 2.0
-    python segment.py stl/0325.stl --spacing 1.5 --plane-size 8 --wireframe
-    python segment.py stl/0325.stl --threshold-ratio 0.6 --skip-extremes
-    python segment.py stl/0325.stl --show mesh curve
+    python3 segment.py                           # launch GUI with no file
+    python3 segment.py stl/0325.stl              # launch GUI with file preloaded
+    python3 segment.py stl/0325.stl --spacing 2.0
+    python3 segment.py stl/0325.stl --spacing 1.5 --plane-size 8 --wireframe
+    python3 segment.py stl/0325.stl --threshold-ratio 0.6 --skip-extremes
 
 Arguments:
-    stl                 Path to the input STL file
+    stl                 Path to the input STL file (optional; can load from GUI)
     --spacing           Distance between slicing planes (default: 0.02)
     --plane-size        Half-size of rendered slice planes (default: 5.0)
-    --show              Items to render: mesh, curve, planes (default: mesh curve planes)
     --wireframe         Render mesh as wireframe instead of solid surface
     --threshold-ratio   Z-extent ratio below which a plane is classified as a
                         connector region (default: 0.75)
-    --skip-extremes     Discard connector groups that touch the first or last plane
+    --no-skip-extremes  Keep connector groups that touch the first or last plane
 """
 
 import argparse
@@ -247,15 +246,15 @@ def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
     threshold_ratio: float = 0.75,
-    skip_extremes: bool = False,
+    skip_extremes: bool = True,
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
     Z-extent of the mesh/plane intersection falls below
     *threshold_ratio* × median Z-extent.
 
-    If *skip_extremes* is True, connector groups that touch the first or
-    last plane are discarded (they are typically mesh boundary artifacts,
-    not real connectors).
+    If *skip_extremes* is True (default), connector groups that touch the
+    first or last plane are discarded (they are typically mesh boundary
+    artifacts, not real connectors).
 
     Returns a list of connector groups, each group being a list of
     consecutive planes that form one connector region.
@@ -438,88 +437,260 @@ def make_planes_geometry(planes: list[dict]) -> list[o3d.geometry.TriangleMesh]:
         quads.append(quad)
     return quads
 
-def render(*geometries) -> None:
-    """Render any number of Open3D geometry objects with transparency support."""
-    flat = []
-    for g in geometries:
-        if isinstance(g, list):
-            flat.extend(g)
+# ── 6. Interactive GUI ────────────────────────────────────────────────────
+
+class OcclusalApp:
+    """Open3D GUI application with adjustable parameters and a Recompute button."""
+
+    MENU_OPEN = 1
+
+    def __init__(self, stl_path: str | None = None, spacing: float = 0.02,
+                 plane_size: float = 5.0, threshold_ratio: float = 0.75,
+                 skip_extremes: bool = True, wireframe: bool = False):
+        self._mesh: trimesh.Trimesh | None = None
+        self._curve: np.ndarray | None = None
+
+        gui = o3d.visualization.gui
+        self._gui = gui
+
+        self._app = gui.Application.instance
+        self._app.initialize()
+
+        # ── Window ──
+        self._window = self._app.create_window("Occlusal Plane Slicing", 1400, 900)
+        w = self._window
+
+        # ── 3D Scene ──
+        self._scene = gui.SceneWidget()
+        self._scene.scene = o3d.visualization.rendering.Open3DScene(w.renderer)
+        self._scene.scene.set_background([0.0, 0.0, 0.0, 1.0])
+
+        # ── Settings panel ──
+        em = w.theme.font_size
+        self._panel = gui.Vert(0.5 * em, gui.Margins(0.5 * em, 0.5 * em,
+                                                       0.5 * em, 0.5 * em))
+
+        # Load mesh button
+        load_btn = gui.Button("Load Mesh…")
+        load_btn.set_on_clicked(self._on_load_mesh)
+        self._panel.add_child(load_btn)
+
+        self._file_label = gui.Label("No file loaded")
+        self._panel.add_child(self._file_label)
+
+        sep = gui.Label("─── Parameters ───")
+        self._panel.add_child(sep)
+
+        # Spacing
+        self._panel.add_child(gui.Label("Spacing"))
+        self._spacing_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._spacing_edit.double_value = spacing
+        self._spacing_edit.set_limits(0.001, 100.0)
+        self._panel.add_child(self._spacing_edit)
+
+        # Plane half-size
+        self._panel.add_child(gui.Label("Plane half-size"))
+        self._plane_size_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._plane_size_edit.double_value = plane_size
+        self._plane_size_edit.set_limits(0.1, 100.0)
+        self._panel.add_child(self._plane_size_edit)
+
+        # Threshold ratio
+        self._panel.add_child(gui.Label("Threshold ratio"))
+        self._threshold_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._threshold_edit.double_value = threshold_ratio
+        self._threshold_edit.set_limits(0.01, 1.0)
+        self._panel.add_child(self._threshold_edit)
+
+        # Skip extremes
+        self._skip_extremes_cb = gui.Checkbox("Skip extremes")
+        self._skip_extremes_cb.checked = skip_extremes
+        self._panel.add_child(self._skip_extremes_cb)
+
+        # Wireframe
+        self._wireframe_cb = gui.Checkbox("Wireframe")
+        self._wireframe_cb.checked = wireframe
+        self._panel.add_child(self._wireframe_cb)
+
+        # Show options
+        self._show_mesh_cb = gui.Checkbox("Show mesh")
+        self._show_mesh_cb.checked = True
+        self._panel.add_child(self._show_mesh_cb)
+
+        self._show_curve_cb = gui.Checkbox("Show curve")
+        self._show_curve_cb.checked = True
+        self._panel.add_child(self._show_curve_cb)
+
+        self._show_planes_cb = gui.Checkbox("Show planes")
+        self._show_planes_cb.checked = False
+        self._panel.add_child(self._show_planes_cb)
+
+        self._show_connectors_cb = gui.Checkbox("Show connectors")
+        self._show_connectors_cb.checked = True
+        self._panel.add_child(self._show_connectors_cb)
+
+        # Recompute button
+        sep2 = gui.Label("")
+        self._panel.add_child(sep2)
+        recompute_btn = gui.Button("Recompute")
+        recompute_btn.set_on_clicked(self._on_recompute)
+        self._panel.add_child(recompute_btn)
+
+        # Status
+        self._status_label = gui.Label("")
+        self._panel.add_child(self._status_label)
+
+        # ── Layout ──
+        w.set_on_layout(self._on_layout)
+        w.add_child(self._scene)
+        w.add_child(self._panel)
+
+        # Load initial file if provided
+        if stl_path:
+            self._load_file(stl_path)
+
+    def _on_layout(self, layout_context):
+        r = self._window.content_rect
+        panel_width = 220
+        self._scene.frame = o3d.visualization.gui.Rect(
+            r.x, r.y, r.width - panel_width, r.height)
+        self._panel.frame = o3d.visualization.gui.Rect(
+            r.get_right() - panel_width, r.y, panel_width, r.height)
+
+    def _on_load_mesh(self):
+        gui = self._gui
+        dlg = gui.FileDialog(gui.FileDialog.OPEN, "Select STL file",
+                             self._window.theme)
+        dlg.add_filter(".stl", "STL files (.stl)")
+        dlg.add_filter("", "All files")
+        dlg.set_on_cancel(self._on_file_cancel)
+        dlg.set_on_done(self._on_file_done)
+        self._window.show_dialog(dlg)
+
+    def _on_file_cancel(self):
+        self._window.close_dialog()
+
+    def _on_file_done(self, path):
+        self._window.close_dialog()
+        self._load_file(path)
+
+    def _load_file(self, path: str):
+        try:
+            mesh = load_mesh(path)
+            mesh = align_mesh(mesh)
+            pts = slice_at_z0(mesh)
+            curve = fit_occlusal_curve(pts, mesh_vertices=mesh.vertices)
+            self._mesh = mesh
+            self._curve = curve
+            self._file_label.text = path.split("/")[-1]
+            self._status_label.text = f"{len(pts)} intersections"
+            self._rebuild_scene()
+        except Exception as e:
+            self._status_label.text = f"Error: {e}"
+
+    def _on_recompute(self):
+        if self._mesh is None:
+            self._status_label.text = "No mesh loaded"
+            return
+        self._rebuild_scene()
+
+    def _rebuild_scene(self):
+        if self._mesh is None:
+            return
+
+        scene = self._scene.scene
+        scene.clear_geometry()
+
+        mesh = self._mesh
+        curve = self._curve
+
+        spacing = self._spacing_edit.double_value
+        plane_size = self._plane_size_edit.double_value
+        threshold_ratio = self._threshold_edit.double_value
+        skip_extremes = self._skip_extremes_cb.checked
+        wireframe = self._wireframe_cb.checked
+
+        # Mesh
+        if self._show_mesh_cb.checked:
+            geom = make_mesh_geometry(mesh, wireframe=wireframe)
+            mat = o3d.visualization.rendering.MaterialRecord()
+            mat.shader = "defaultLit"
+            mat.base_color = [1.0, 1.0, 1.0, 1.0]
+            if wireframe:
+                mat.shader = "unlitLine"
+                mat.line_width = 1.0
+            scene.add_geometry("mesh", geom, mat)
+
+        # Curve
+        if self._show_curve_cb.checked and curve is not None:
+            tube = make_curve_geometry(curve)
+            mat_c = o3d.visualization.rendering.MaterialRecord()
+            mat_c.shader = "defaultLit"
+            mat_c.base_color = [0.0, 0.3, 1.0, 1.0]
+            scene.add_geometry("curve", tube, mat_c)
+
+        # Planes and connectors
+        planes = create_slicing_planes(curve, spacing=spacing,
+                                       plane_half_size=plane_size)
+
+        if self._show_planes_cb.checked:
+            quads = make_planes_geometry(planes)
+            for i, q in enumerate(quads):
+                mat_p = o3d.visualization.rendering.MaterialRecord()
+                mat_p.shader = "defaultLit"
+                mat_p.base_color = [1.0, 0.2, 0.2, 0.6]
+                scene.add_geometry(f"plane_{i}", q, mat_p)
+
+        if self._show_connectors_cb.checked:
+            connectors = find_connectors(mesh, planes,
+                                         threshold_ratio=threshold_ratio,
+                                         skip_extremes=skip_extremes)
+            if connectors:
+                pcd = make_connectors_geometry(mesh, connectors)
+                mat_conn = o3d.visualization.rendering.MaterialRecord()
+                mat_conn.shader = "defaultUnlit"
+                mat_conn.point_size = 3.0
+                scene.add_geometry("connectors", pcd, mat_conn)
+            self._status_label.text = (
+                f"{len(planes)} planes, {len(connectors)} connectors")
         else:
-            flat.append(g)
+            self._status_label.text = f"{len(planes)} planes"
 
-    if not flat:
-        print("Nothing to render.")
-        return
+        # Fit camera to scene
+        bounds = scene.bounding_box
+        self._scene.setup_camera(60.0, bounds, bounds.get_center())
 
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="Occlusal Plane Slicing", width=1280, height=800)
-
-    for g in flat:
-        vis.add_geometry(g)
-
-    opt = vis.get_render_option()
-    opt.mesh_show_back_face = True
-    opt.background_color = np.array([0.0, 0.0, 0.0])
-
-    vis.run()
-    vis.destroy_window()
+    def run(self):
+        self._app.run()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Occlusal-plane slicing of dental STL")
-    parser.add_argument("stl", help="Path to the input STL file")
+    parser.add_argument("stl", nargs="?", default=None,
+                        help="Path to the input STL file (optional; can load from GUI)")
     parser.add_argument("--spacing", type=float, default=0.02,
                         help="Distance between slicing planes (default: 0.02)")
     parser.add_argument("--plane-size", type=float, default=5.0,
                         help="Half-size of rendered slice planes (default: 5)")
-    parser.add_argument("--show", nargs="+", default=["mesh", "curve", "planes"],
-                        choices=["mesh", "curve", "planes"],
-                        help="Items to render (default: mesh curve planes)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
     parser.add_argument("--threshold-ratio", type=float, default=0.75,
                         help="Z-extent ratio below which a plane is a connector (default: 0.75)")
-    parser.add_argument("--skip-extremes", action="store_true",
-                        help="Discard connector groups at the first/last plane")
+    parser.add_argument("--no-skip-extremes", action="store_true",
+                        help="Keep connector groups at the first/last plane")
     args = parser.parse_args()
 
-    print(f"Loading {args.stl} …")
-    mesh = load_mesh(args.stl)
-
-    print("Aligning mesh …")
-    mesh = align_mesh(mesh)
-
-    print("Slicing at Z=0 …")
-    pts = slice_at_z0(mesh)
-    print(f"  → {len(pts)} intersection points")
-
-    print("Fitting occlusal curve …")
-    curve = fit_occlusal_curve(pts, mesh_vertices=mesh.vertices)
-
-    print(f"Creating slicing planes (every {args.spacing}) …")
-    planes = create_slicing_planes(curve, spacing=args.spacing,
-                                   plane_half_size=args.plane_size)
-    print(f"  → {len(planes)} planes")
-
-    print("Detecting connectors …")
-    connectors = find_connectors(mesh, planes,
-                                  threshold_ratio=args.threshold_ratio,
-                                  skip_extremes=args.skip_extremes)
-    print(f"  → {len(connectors)} connector regions detected")
-
-    print("Rendering …")
-    items = []
-    if "mesh" in args.show:
-        items.append(make_mesh_geometry(mesh, wireframe=args.wireframe))
-    if "curve" in args.show:
-        items.append(make_curve_geometry(curve))
-    # if "planes" in args.show:
-    #     items.append(make_planes_geometry(planes))
-    if connectors:
-        items.append(make_connectors_geometry(mesh, connectors))
-    render(*items)
+    app = OcclusalApp(
+        stl_path=args.stl,
+        spacing=args.spacing,
+        plane_size=args.plane_size,
+        threshold_ratio=args.threshold_ratio,
+        skip_extremes=not args.no_skip_extremes,
+        wireframe=args.wireframe,
+    )
+    app.run()
 
 
 if __name__ == "__main__":
