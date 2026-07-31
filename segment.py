@@ -249,8 +249,8 @@ def find_connectors(
     skip_extremes: bool = True,
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
-    Z-extent of the mesh/plane intersection falls below
-    *threshold_ratio* × median Z-extent.
+    maximum vertical distance from the cross-section to the occlusal curve
+    falls below *threshold_ratio* × the median distance.
 
     If *skip_extremes* is True (default), connector groups that touch the
     first or last plane are discarded (they are typically mesh boundary
@@ -259,25 +259,26 @@ def find_connectors(
     Returns a list of connector groups, each group being a list of
     consecutive planes that form one connector region.
     """
-    z_extents = []
+    distances = []
     for pl in planes:
         section = mesh.section(
             plane_origin=pl["origin"],
             plane_normal=pl["normal"],
         )
         if section is None:
-            z_extents.append(0.0)
+            distances.append(0.0)
             continue
         verts = section.vertices
-        z_extent = verts[:, 2].max() - verts[:, 2].min()
-        z_extents.append(z_extent)
+        # Max vertical distance from cross-section to the occlusal curve point
+        dist = np.max(np.abs(verts[:, 2] - pl["origin"][2]))
+        distances.append(dist)
 
-    z_extents = np.array(z_extents)
-    median_z = np.median(z_extents[z_extents > 0]) if np.any(z_extents > 0) else 1.0
-    threshold = threshold_ratio * median_z
+    distances = np.array(distances)
+    median_d = np.median(distances[distances > 0]) if np.any(distances > 0) else 1.0
+    threshold = threshold_ratio * median_d
 
     # Find connector plane indices and group consecutive runs
-    is_connector = [(0 < ze < threshold) for ze in z_extents]
+    is_connector = [(0 < d < threshold) for d in distances]
     groups: list[list[dict]] = []
     current_group: list[int] = []
     for i, flag in enumerate(is_connector):
@@ -445,7 +446,7 @@ class OcclusalApp:
     MENU_OPEN = 1
 
     def __init__(self, stl_path: str | None = None, spacing: float = 0.02,
-                 plane_size: float = 5.0, threshold_ratio: float = 0.75,
+                 plane_size: float = 7.5, threshold_ratio: float = 0.75,
                  skip_extremes: bool = True, wireframe: bool = False):
         self._mesh: trimesh.Trimesh | None = None
         self._curve: np.ndarray | None = None
@@ -524,6 +525,10 @@ class OcclusalApp:
         self._show_planes_cb = gui.Checkbox("Show planes")
         self._show_planes_cb.checked = False
         self._panel.add_child(self._show_planes_cb)
+
+        self._show_connector_planes_only_cb = gui.Checkbox("Connector planes only")
+        self._show_connector_planes_only_cb.checked = False
+        self._panel.add_child(self._show_connector_planes_only_cb)
 
         self._show_connectors_cb = gui.Checkbox("Show connectors")
         self._show_connectors_cb.checked = True
@@ -633,18 +638,34 @@ class OcclusalApp:
         planes = create_slicing_planes(curve, spacing=spacing,
                                        plane_half_size=plane_size)
 
-        if self._show_planes_cb.checked:
+        connectors = find_connectors(mesh, planes,
+                                     threshold_ratio=threshold_ratio,
+                                     skip_extremes=skip_extremes)
+        connector_indices = set()
+        for group in connectors:
+            for pl in group:
+                for i, p in enumerate(planes):
+                    if p is pl:
+                        connector_indices.add(i)
+                        break
+
+        if self._show_planes_cb.checked or self._show_connector_planes_only_cb.checked:
             quads = make_planes_geometry(planes)
             for i, q in enumerate(quads):
+                is_conn = i in connector_indices
+                if not self._show_planes_cb.checked and not is_conn:
+                    continue
+                if self._show_connector_planes_only_cb.checked and not self._show_planes_cb.checked and not is_conn:
+                    continue
                 mat_p = o3d.visualization.rendering.MaterialRecord()
                 mat_p.shader = "defaultLit"
-                mat_p.base_color = [1.0, 0.2, 0.2, 0.6]
+                if is_conn:
+                    mat_p.base_color = [0.0, 1.0, 0.3, 0.6]
+                else:
+                    mat_p.base_color = [1.0, 0.2, 0.2, 0.6]
                 scene.add_geometry(f"plane_{i}", q, mat_p)
 
         if self._show_connectors_cb.checked:
-            connectors = find_connectors(mesh, planes,
-                                         threshold_ratio=threshold_ratio,
-                                         skip_extremes=skip_extremes)
             if connectors:
                 pcd = make_connectors_geometry(mesh, connectors)
                 mat_conn = o3d.visualization.rendering.MaterialRecord()
@@ -672,8 +693,8 @@ def main():
                         help="Path to the input STL file (optional; can load from GUI)")
     parser.add_argument("--spacing", type=float, default=0.02,
                         help="Distance between slicing planes (default: 0.02)")
-    parser.add_argument("--plane-size", type=float, default=5.0,
-                        help="Half-size of rendered slice planes (default: 5)")
+    parser.add_argument("--plane-size", type=float, default=7.5,
+                        help="Half-size of rendered slice planes (default: 7.5)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
     parser.add_argument("--threshold-ratio", type=float, default=0.75,
