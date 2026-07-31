@@ -18,11 +18,11 @@ Usage:
 
 Arguments:
     stl                 Path to the input STL file (optional; can load from GUI)
-    --spacing           Distance between slicing planes (default: 0.02)
+    --spacing           Distance between slicing planes (default: 0.05)
     --plane-size        Half-size of rendered slice planes (default: 5.0)
     --wireframe         Render mesh as wireframe instead of solid surface
     --threshold-ratio   Z-extent ratio below which a plane is classified as a
-                        connector region (default: 0.75)
+                        connector region (default: 0.85)
     --no-skip-extremes  Keep connector groups that touch the first or last plane
 """
 
@@ -191,7 +191,7 @@ def _cumulative_arc_length(curve: np.ndarray) -> np.ndarray:
 
 def create_slicing_planes(
     curve: np.ndarray,
-    spacing: float = 0.02,
+    spacing: float = 0.05,
     plane_half_size: float = 5.0,
 ) -> list[dict]:
     """Return a list of dicts with keys 'origin', 'normal', and 'corners'
@@ -245,12 +245,16 @@ def create_slicing_planes(
 def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
-    threshold_ratio: float = 0.75,
+    threshold_ratio: float = 0.85,
     skip_extremes: bool = True,
+    neighbor_distance: float = 10.0,
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
     maximum vertical distance from the cross-section to the occlusal curve
-    falls below *threshold_ratio* × the median distance.
+    falls below *threshold_ratio* × the local median distance.
+
+    The local median is computed from neighboring planes within
+    *neighbor_distance* units along the curve (equally divided left/right).
 
     If *skip_extremes* is True (default), connector groups that touch the
     first or last plane are discarded (they are typically mesh boundary
@@ -274,11 +278,25 @@ def find_connectors(
         distances.append(dist)
 
     distances = np.array(distances)
-    median_d = np.median(distances[distances > 0]) if np.any(distances > 0) else 1.0
-    threshold = threshold_ratio * median_d
 
-    # Find connector plane indices and group consecutive runs
-    is_connector = [(0 < d < threshold) for d in distances]
+    # Compute arc positions of each plane origin along the curve
+    origins = np.array([pl["origin"] for pl in planes])
+    arc_diffs = np.linalg.norm(np.diff(origins, axis=0), axis=1)
+    arc_pos = np.concatenate([[0], np.cumsum(arc_diffs)])
+
+    # Per-plane local median within neighbor_distance (half each side)
+    half = neighbor_distance / 2.0
+    is_connector = []
+    for i in range(len(planes)):
+        left = arc_pos[i] - half
+        right = arc_pos[i] + half
+        mask = (arc_pos >= left) & (arc_pos <= right) & (distances > 0)
+        if mask.any():
+            local_median = np.median(distances[mask])
+        else:
+            local_median = 1.0
+        threshold = threshold_ratio * local_median
+        is_connector.append(0 < distances[i] < threshold)
     groups: list[list[dict]] = []
     current_group: list[int] = []
     for i, flag in enumerate(is_connector):
@@ -445,9 +463,10 @@ class OcclusalApp:
 
     MENU_OPEN = 1
 
-    def __init__(self, stl_path: str | None = None, spacing: float = 0.02,
-                 plane_size: float = 7.5, threshold_ratio: float = 0.75,
-                 skip_extremes: bool = True, wireframe: bool = False):
+    def __init__(self, stl_path: str | None = None, spacing: float = 0.05,
+                 plane_size: float = 7.5, threshold_ratio: float = 0.85,
+                 skip_extremes: bool = True, wireframe: bool = False,
+                 neighbor_distance: float = 10.0):
         self._mesh: trimesh.Trimesh | None = None
         self._curve: np.ndarray | None = None
 
@@ -502,6 +521,13 @@ class OcclusalApp:
         self._threshold_edit.double_value = threshold_ratio
         self._threshold_edit.set_limits(0.01, 1.0)
         self._panel.add_child(self._threshold_edit)
+
+        # Neighbor distance
+        self._panel.add_child(gui.Label("Neighbor distance"))
+        self._neighbor_dist_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._neighbor_dist_edit.double_value = neighbor_distance
+        self._neighbor_dist_edit.set_limits(0.1, 1000.0)
+        self._panel.add_child(self._neighbor_dist_edit)
 
         # Skip extremes
         self._skip_extremes_cb = gui.Checkbox("Skip extremes")
@@ -612,6 +638,7 @@ class OcclusalApp:
         spacing = self._spacing_edit.double_value
         plane_size = self._plane_size_edit.double_value
         threshold_ratio = self._threshold_edit.double_value
+        neighbor_distance = self._neighbor_dist_edit.double_value
         skip_extremes = self._skip_extremes_cb.checked
         wireframe = self._wireframe_cb.checked
 
@@ -640,7 +667,8 @@ class OcclusalApp:
 
         connectors = find_connectors(mesh, planes,
                                      threshold_ratio=threshold_ratio,
-                                     skip_extremes=skip_extremes)
+                                     skip_extremes=skip_extremes,
+                                     neighbor_distance=neighbor_distance)
         connector_indices = set()
         for group in connectors:
             for pl in group:
@@ -691,16 +719,18 @@ def main():
     parser = argparse.ArgumentParser(description="Occlusal-plane slicing of dental STL")
     parser.add_argument("stl", nargs="?", default=None,
                         help="Path to the input STL file (optional; can load from GUI)")
-    parser.add_argument("--spacing", type=float, default=0.02,
-                        help="Distance between slicing planes (default: 0.02)")
+    parser.add_argument("--spacing", type=float, default=0.05,
+                        help="Distance between slicing planes (default: 0.05)")
     parser.add_argument("--plane-size", type=float, default=7.5,
                         help="Half-size of rendered slice planes (default: 7.5)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
-    parser.add_argument("--threshold-ratio", type=float, default=0.75,
-                        help="Z-extent ratio below which a plane is a connector (default: 0.75)")
+    parser.add_argument("--threshold-ratio", type=float, default=0.85,
+                        help="Z-extent ratio below which a plane is a connector (default: 0.85)")
     parser.add_argument("--no-skip-extremes", action="store_true",
                         help="Keep connector groups at the first/last plane")
+    parser.add_argument("--neighbor-distance", type=float, default=10.0,
+                        help="Arc distance for local median neighborhood (default: 10)")
     args = parser.parse_args()
 
     app = OcclusalApp(
@@ -710,6 +740,7 @@ def main():
         threshold_ratio=args.threshold_ratio,
         skip_extremes=not args.no_skip_extremes,
         wireframe=args.wireframe,
+        neighbor_distance=args.neighbor_distance,
     )
     app.run()
 
