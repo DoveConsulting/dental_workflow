@@ -18,11 +18,11 @@ Usage:
 
 Arguments:
     stl                 Path to the input STL file (optional; can load from GUI)
-    --spacing           Distance between slicing planes (default: 0.05)
+    --spacing           Distance between slicing planes (default: 0.2)
     --plane-size        Half-size of rendered slice planes (default: 5.0)
     --wireframe         Render mesh as wireframe instead of solid surface
     --threshold-ratio   Z-extent ratio below which a plane is classified as a
-                        connector region (default: 0.775)
+                        connector region (default: 0.85)
     --no-skip-extremes  Keep connector groups that touch the first or last plane
 """
 
@@ -177,7 +177,7 @@ def _cumulative_arc_length(curve: np.ndarray) -> np.ndarray:
 
 def create_slicing_planes(
     curve: np.ndarray,
-    spacing: float = 0.05,
+    spacing: float = 0.2,
     plane_half_size: float = 5.0,
 ) -> list[dict]:
     """Return a list of dicts with keys 'origin', 'normal', and 'corners'
@@ -231,10 +231,11 @@ def create_slicing_planes(
 def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
-    threshold_ratio: float = 0.775,
+    threshold_ratio: float = 0.85,
     skip_extremes: bool = True,
     neighbor_distance: float = 10.0,
     height_method: str = "max",
+    max_connector_width: float = 1.0,
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
     maximum vertical distance from the cross-section to the occlusal curve
@@ -305,6 +306,31 @@ def find_connectors(
     if skip_extremes:
         n = len(planes)
         groups = [g for g in groups if g[0] != 0 and g[-1] != n - 1]
+
+    # Trim groups that exceed max_connector_width
+    if max_connector_width > 0:
+        trimmed_groups = []
+        for g in groups:
+            first_origin = planes[g[0]]["origin"]
+            last_origin = planes[g[-1]]["origin"]
+            width = np.linalg.norm(last_origin - first_origin)
+            if width <= max_connector_width:
+                trimmed_groups.append(g)
+            else:
+                # Centre around the plane with the least Z-extent
+                origins = np.array([planes[i]["origin"] for i in g])
+                group_distances = distances[g]
+                center_idx = int(np.argmin(group_distances))
+                center_origin = origins[center_idx]
+                half_w = max_connector_width / 2.0
+                keep = []
+                for j, idx in enumerate(g):
+                    dist = np.linalg.norm(origins[j] - center_origin)
+                    if dist <= half_w:
+                        keep.append(idx)
+                if keep:
+                    trimmed_groups.append(keep)
+        groups = trimmed_groups
 
     # Convert index groups to plane groups
     return [[planes[i] for i in g] for g in groups]
@@ -456,10 +482,11 @@ class OcclusalApp:
 
     MENU_OPEN = 1
 
-    def __init__(self, stl_path: str | None = None, spacing: float = 0.05,
-                 plane_size: float = 7.5, threshold_ratio: float = 0.775,
+    def __init__(self, stl_path: str | None = None, spacing: float = 0.2,
+                 plane_size: float = 7.5, threshold_ratio: float = 0.85,
                  skip_extremes: bool = True, wireframe: bool = False,
-                 neighbor_distance: float = 10.0):
+                 neighbor_distance: float = 10.0,
+                 max_connector_width: float = 1.0):
         self._mesh: trimesh.Trimesh | None = None
         self._curve: np.ndarray | None = None
 
@@ -521,6 +548,13 @@ class OcclusalApp:
         self._neighbor_dist_edit.double_value = neighbor_distance
         self._neighbor_dist_edit.set_limits(0.1, 1000.0)
         self._panel.add_child(self._neighbor_dist_edit)
+
+        # Max connector width
+        self._panel.add_child(gui.Label("Max connector width"))
+        self._max_conn_width_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._max_conn_width_edit.double_value = max_connector_width
+        self._max_conn_width_edit.set_limits(0.1, 1000.0)
+        self._panel.add_child(self._max_conn_width_edit)
 
         # Height method
         self._panel.add_child(gui.Label("Height method"))
@@ -666,11 +700,13 @@ class OcclusalApp:
                                        plane_half_size=plane_size)
 
         height_method = "median" if self._height_max_rb.selected_index == 1 else "max"
+        max_connector_width = self._max_conn_width_edit.double_value
         connectors = find_connectors(mesh, planes,
                                      threshold_ratio=threshold_ratio,
                                      skip_extremes=skip_extremes,
                                      neighbor_distance=neighbor_distance,
-                                     height_method=height_method)
+                                     height_method=height_method,
+                                     max_connector_width=max_connector_width)
         connector_indices = set()
         for group in connectors:
             for pl in group:
@@ -721,18 +757,20 @@ def main():
     parser = argparse.ArgumentParser(description="Occlusal-plane slicing of dental STL")
     parser.add_argument("stl", nargs="?", default=None,
                         help="Path to the input STL file (optional; can load from GUI)")
-    parser.add_argument("--spacing", type=float, default=0.05,
-                        help="Distance between slicing planes (default: 0.05)")
+    parser.add_argument("--spacing", type=float, default=0.2,
+                        help="Distance between slicing planes (default: 0.2)")
     parser.add_argument("--plane-size", type=float, default=7.5,
                         help="Half-size of rendered slice planes (default: 7.5)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
     parser.add_argument("--threshold-ratio", type=float, default=0.85,
-                        help="Z-extent ratio below which a plane is a connector (default: 0.775)")
+                        help="Z-extent ratio below which a plane is a connector (default: 0.85)")
     parser.add_argument("--no-skip-extremes", action="store_true",
                         help="Keep connector groups at the first/last plane")
     parser.add_argument("--neighbor-distance", type=float, default=10.0,
                         help="Arc distance for local median neighborhood (default: 10)")
+    parser.add_argument("--max-connector-width", type=float, default=1.0,
+                        help="Max width of a connector region (default: 1.0)")
     args = parser.parse_args()
 
     app = OcclusalApp(
@@ -743,6 +781,7 @@ def main():
         skip_extremes=not args.no_skip_extremes,
         wireframe=args.wireframe,
         neighbor_distance=args.neighbor_distance,
+        max_connector_width=args.max_connector_width,
     )
     app.run()
 
