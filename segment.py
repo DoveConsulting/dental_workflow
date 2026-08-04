@@ -4,8 +4,8 @@ Dental STL — Occlusal-plane slicing
 ------------------------------------
 1. Load STL
 2. Align mesh (translate to origin, PCA rotation: widest spread XY, least Z)
-3. Slice at Z=0 to get the arch intersection curve
-4. Fit a 3D spline to those intersection points (occlusal curve)
+3. Sample mesh surface points and project onto the Z=0 (occlusal) plane
+4. Fit a parabolic arch through the projected points (occlusal curve)
 5. Create equally spaced slicing planes tangent to the curve
 6. Render mesh + slicing planes with Open3D
 
@@ -22,7 +22,7 @@ Arguments:
     --plane-size        Half-size of rendered slice planes (default: 5.0)
     --wireframe         Render mesh as wireframe instead of solid surface
     --threshold-ratio   Z-extent ratio below which a plane is classified as a
-                        connector region (default: 0.85)
+                        connector region (default: 0.775)
     --no-skip-extremes  Keep connector groups that touch the first or last plane
 """
 
@@ -69,28 +69,14 @@ def align_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return mesh
 
 
-# ── 3. Slice at Z=0 ──────────────────────────────────────────────────────
+# ── 3. Project sampled mesh points onto the occlusal plane ───────────────
 
-def slice_at_z0(mesh: trimesh.Trimesh) -> np.ndarray:
-    """Slice the mesh at Z=0 and return the centroid of each discrete
-    cross-section loop as an Nx3 array (one point per tooth outline)."""
-    section = mesh.section(plane_origin=[0, 0, 0], plane_normal=[0, 0, 1])
-    if section is None:
-        raise RuntimeError("Mesh does not intersect the Z=0 plane")
-
-    points_2d, _ = section.to_planar()
-
-    centroids = []
-    for entity in points_2d.entities:
-        pts = points_2d.vertices[entity.points]
-        centroids.append(pts.mean(axis=0))
-
-    centroids = np.array(centroids)
-    pts_3d = np.column_stack([
-        centroids[:, 0],
-        centroids[:, 1],
-        np.zeros(len(centroids)),
-    ])
+def project_mesh_to_plane(mesh: trimesh.Trimesh, num_samples: int = 5000) -> np.ndarray:
+    """Sample points on the mesh surface and project them onto the Z=0
+    (occlusal) plane.  Returns an Nx3 array with Z=0."""
+    sampled, _ = trimesh.sample.sample_surface(mesh, num_samples)
+    pts_3d = np.column_stack([sampled[:, 0], sampled[:, 1],
+                              np.zeros(len(sampled))])
     return pts_3d
 
 
@@ -245,7 +231,7 @@ def create_slicing_planes(
 def find_connectors(
     mesh: trimesh.Trimesh,
     planes: list[dict],
-    threshold_ratio: float = 0.85,
+    threshold_ratio: float = 0.775,
     skip_extremes: bool = True,
     neighbor_distance: float = 10.0,
     height_method: str = "max",
@@ -471,7 +457,7 @@ class OcclusalApp:
     MENU_OPEN = 1
 
     def __init__(self, stl_path: str | None = None, spacing: float = 0.05,
-                 plane_size: float = 7.5, threshold_ratio: float = 0.85,
+                 plane_size: float = 7.5, threshold_ratio: float = 0.775,
                  skip_extremes: bool = True, wireframe: bool = False,
                  neighbor_distance: float = 10.0):
         self._mesh: trimesh.Trimesh | None = None
@@ -623,7 +609,7 @@ class OcclusalApp:
         try:
             mesh = load_mesh(path)
             mesh = align_mesh(mesh)
-            pts = slice_at_z0(mesh)
+            pts = project_mesh_to_plane(mesh)
             curve = fit_occlusal_curve(pts, mesh_vertices=mesh.vertices)
             self._mesh = mesh
             self._curve = curve
@@ -742,7 +728,7 @@ def main():
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe instead of solid")
     parser.add_argument("--threshold-ratio", type=float, default=0.85,
-                        help="Z-extent ratio below which a plane is a connector (default: 0.85)")
+                        help="Z-extent ratio below which a plane is a connector (default: 0.775)")
     parser.add_argument("--no-skip-extremes", action="store_true",
                         help="Keep connector groups at the first/last plane")
     parser.add_argument("--neighbor-distance", type=float, default=10.0,
