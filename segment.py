@@ -236,7 +236,7 @@ def find_connectors(
     neighbor_distance: float = 10.0,
     height_method: str = "max",
     max_connector_width: float = 1.0,
-) -> list[list[dict]]:
+) -> tuple[list[list[dict]], np.ndarray, float]:
     """Identify connector regions: consecutive runs of planes where the
     maximum vertical distance from the cross-section to the occlusal curve
     falls below *threshold_ratio* × the local reference distance.
@@ -251,9 +251,15 @@ def find_connectors(
     first or last plane are discarded (they are typically mesh boundary
     artifacts, not real connectors).
 
-    Returns a list of connector groups, each group being a list of
-    consecutive planes that form one connector region.
+    Returns (connector_groups, distances) where *distances* is the Z-extent
+    per plane and *connector_groups* is a list of groups, each group being
+    a list of consecutive planes that form one connector region.
     """
+    # Determine the "closed" Z direction: the side where the bulk of the
+    # mesh sits (away from cavities).  The mean vertex Z is offset toward
+    # the solid/gum side after PCA alignment.
+    closed_sign = 1.0 if mesh.vertices[:, 2].mean() >= 0 else -1.0
+
     distances = []
     for pl in planes:
         section = mesh.section(
@@ -264,8 +270,9 @@ def find_connectors(
             distances.append(0.0)
             continue
         verts = section.vertices
-        # Max vertical distance from cross-section to the occlusal curve point
-        dist = np.max(np.abs(verts[:, 2] - pl["origin"][2]))
+        # Z-extent only toward the closed (solid) side of the mesh
+        dz = closed_sign * (verts[:, 2] - pl["origin"][2])
+        dist = max(float(np.max(dz)), 0.0)
         distances.append(dist)
 
     distances = np.array(distances)
@@ -333,7 +340,7 @@ def find_connectors(
         groups = trimmed_groups
 
     # Convert index groups to plane groups
-    return [[planes[i] for i in g] for g in groups]
+    return [[planes[i] for i in g] for g in groups], distances, closed_sign
 
 
 def make_connectors_geometry(
@@ -475,6 +482,33 @@ def make_planes_geometry(planes: list[dict]) -> list[o3d.geometry.TriangleMesh]:
         quads.append(quad)
     return quads
 
+def make_distances_geometry(
+    planes: list[dict],
+    distances: np.ndarray,
+    closed_sign: float = 1.0,
+) -> o3d.geometry.LineSet:
+    """Return a LineSet showing a vertical line at each plane origin whose
+    height equals the Z-extent distance used for thresholding, pointing
+    in the actual measurement direction (toward the closed side)."""
+    points = []
+    lines = []
+    for i, pl in enumerate(planes):
+        origin = pl["origin"]
+        d = distances[i]
+        bottom = origin.copy()
+        top = origin.copy()
+        top[2] = origin[2] + closed_sign * d
+        idx = len(points)
+        points.append(bottom)
+        points.append(top)
+        lines.append([idx, idx + 1])
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.array(points))
+    ls.lines = o3d.utility.Vector2iVector(np.array(lines))
+    ls.paint_uniform_color([1.0, 1.0, 0.0])
+    return ls
+
 # ── 6. Interactive GUI ────────────────────────────────────────────────────
 
 class OcclusalApp:
@@ -489,6 +523,7 @@ class OcclusalApp:
                  max_connector_width: float = 1.0):
         self._mesh: trimesh.Trimesh | None = None
         self._curve: np.ndarray | None = None
+        self._3d_labels: list = []
 
         gui = o3d.visualization.gui
         self._gui = gui
@@ -594,6 +629,10 @@ class OcclusalApp:
         self._show_connectors_cb.checked = True
         self._panel.add_child(self._show_connectors_cb)
 
+        self._show_distances_cb = gui.Checkbox("Show distances")
+        self._show_distances_cb.checked = False
+        self._panel.add_child(self._show_distances_cb)
+
         # Recompute button
         sep2 = gui.Label("")
         self._panel.add_child(sep2)
@@ -666,6 +705,11 @@ class OcclusalApp:
         scene = self._scene.scene
         scene.clear_geometry()
 
+        # Remove any previous 3D labels
+        for lbl in self._3d_labels:
+            self._scene.remove_3d_label(lbl)
+        self._3d_labels.clear()
+
         mesh = self._mesh
         curve = self._curve
 
@@ -701,7 +745,7 @@ class OcclusalApp:
 
         height_method = "median" if self._height_max_rb.selected_index == 1 else "max"
         max_connector_width = self._max_conn_width_edit.double_value
-        connectors = find_connectors(mesh, planes,
+        connectors, distances, closed_sign = find_connectors(mesh, planes,
                                      threshold_ratio=threshold_ratio,
                                      skip_extremes=skip_extremes,
                                      neighbor_distance=neighbor_distance,
@@ -742,6 +786,23 @@ class OcclusalApp:
                 f"{len(planes)} planes, {len(connectors)} connectors")
         else:
             self._status_label.text = f"{len(planes)} planes"
+
+        # Distance visualisation (vertical lines + numerical labels)
+        if self._show_distances_cb.checked:
+            ls = make_distances_geometry(planes, distances, closed_sign)
+            mat_d = o3d.visualization.rendering.MaterialRecord()
+            mat_d.shader = "unlitLine"
+            mat_d.line_width = 2.0
+            scene.add_geometry("dist_lines", ls, mat_d)
+            # 3D text labels at the top of each line
+            for i, pl in enumerate(planes):
+                d = distances[i]
+                if d <= 0:
+                    continue
+                label_pos = pl["origin"].copy()
+                label_pos[2] += closed_sign * d
+                lbl = self._scene.add_3d_label(label_pos, f"{d:.2f}")
+                self._3d_labels.append(lbl)
 
         # Fit camera to scene
         bounds = scene.bounding_box
