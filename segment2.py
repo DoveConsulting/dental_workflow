@@ -162,7 +162,7 @@ def find_narrowings(
     outline: np.ndarray,
     width_ratio: float = 0.5,
     min_arc_gap: float = 0.25,
-    smooth_window: int = 5,
+    sigma: float = 3.0,
 ) -> list[dict]:
     """Find narrowing regions along the closed outline curve.
 
@@ -170,87 +170,116 @@ def find_narrowings(
     point on the opposite side of the curve (excluding neighbours within
     *min_arc_gap* fraction of the total arc length on each side).
 
-    A narrowing is a local minimum of the width profile whose value is below
-    *width_ratio* × the median width.
+    Local minima are detected via numerical differentiation of the Gaussian-
+    smoothed width profile:
+      1. Smooth width(s) with a Gaussian kernel of standard deviation *sigma*
+         (in index space).
+      2. Compute the first derivative dw/ds using central finite differences.
+      3. Locate zero-crossings where dw/ds goes from negative to positive
+         (transition from decreasing to increasing width → local minimum).
+      4. Confirm with second derivative d²w/ds² > 0 (concave-up).
+      5. Keep only minima below *width_ratio* × median width.
 
     Returns a list of dicts with keys:
-        'index'  – index into *outline*
-        'point'  – the outline point at the narrowing
+        'index'    – index into *outline*
+        'point'    – the outline point at the narrowing
         'opposite' – the closest opposing outline point
-        'width'  – the local width value
+        'width'    – the smoothed width value at the minimum
     """
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.spatial import cKDTree
+
     n = len(outline)
-    if n < 6:
+    if n < 10:
         return []
 
-    # Cumulative arc length (closed loop)
+    # ── Arc length parameterisation (closed loop) ──
     diffs = np.diff(outline, axis=0)
     seg_lens = np.linalg.norm(diffs, axis=1)
-    # Add closing segment
     close_len = np.linalg.norm(outline[0] - outline[-1])
     all_lens = np.append(seg_lens, close_len)
     arc = np.concatenate([[0], np.cumsum(all_lens)])
     total_arc = arc[-1]
     gap = min_arc_gap * total_arc
 
-    # For each point, find the closest non-adjacent point
+    # ── Vectorised width computation ──
+    tree = cKDTree(outline)
+    # Query many neighbours at once and filter by arc distance
+    k = min(n, max(64, int(n * 0.4)))
+    dists_all, idxs_all = tree.query(outline, k=k)
+
     widths = np.full(n, np.inf)
     closest_idx = np.zeros(n, dtype=int)
 
     for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            # Arc distance along the curve (shorter path around the loop)
+        for rank in range(1, k):  # skip rank 0 (self)
+            j = idxs_all[i, rank]
             d_arc_fwd = abs(arc[j] - arc[i])
             d_arc = min(d_arc_fwd, total_arc - d_arc_fwd)
             if d_arc < gap:
                 continue
-            d_eucl = np.linalg.norm(outline[i] - outline[j])
-            if d_eucl < widths[i]:
-                widths[i] = d_eucl
-                closest_idx[i] = j
+            # First valid non-adjacent neighbour by Euclidean distance
+            widths[i] = dists_all[i, rank]
+            closest_idx[i] = j
+            break
 
-    # Replace inf with 0 (points with no valid opposite)
+    # Replace inf with 0
     widths[widths == np.inf] = 0
 
-    # Smooth the width profile
-    if smooth_window > 1 and n > smooth_window:
-        kernel = np.ones(smooth_window) / smooth_window
-        # Pad for circular smoothing
-        padded = np.concatenate([widths[-smooth_window:], widths, widths[:smooth_window]])
-        smoothed = np.convolve(padded, kernel, mode='same')
-        widths_smooth = smoothed[smooth_window:smooth_window + n]
-    else:
-        widths_smooth = widths.copy()
+    # ── Gaussian smoothing (circular / wrap mode) ──
+    w = gaussian_filter1d(widths, sigma=sigma, mode='wrap')
 
-    # Threshold: narrowings must be below width_ratio × median
-    median_w = np.median(widths_smooth[widths_smooth > 0]) if np.any(widths_smooth > 0) else 1.0
-    threshold = width_ratio * median_w
-
-    # Find local minima of smoothed width profile
-    narrowings = []
+    # ── First derivative  dw/ds  (central differences, periodic) ──
+    dw = np.zeros(n)
     for i in range(n):
-        if widths_smooth[i] <= 0 or widths_smooth[i] > threshold:
+        ip = (i + 1) % n
+        im = (i - 1) % n
+        ds = arc[ip] - arc[im]
+        if i == 0:
+            ds = all_lens[0] + all_lens[-1]
+        if ds < 1e-12:
             continue
-        prev_idx = (i - 1) % n
-        next_idx = (i + 1) % n
-        if widths_smooth[i] <= widths_smooth[prev_idx] and widths_smooth[i] <= widths_smooth[next_idx]:
-            narrowings.append({
-                'index': i,
-                'point': outline[i],
-                'opposite': outline[closest_idx[i]],
-                'width': float(widths_smooth[i]),
-            })
+        dw[i] = (w[ip] - w[im]) / ds
 
-    # Deduplicate: if two narrowings point to each other, keep the one with
-    # the smaller width
+    # ── Second derivative  d²w/ds²  (central differences, periodic) ──
+    d2w = np.zeros(n)
+    for i in range(n):
+        ip = (i + 1) % n
+        im = (i - 1) % n
+        ds_p = all_lens[i] if i < n - 1 else all_lens[-1]
+        ds_m = all_lens[im]
+        ds_avg = (ds_p + ds_m) / 2.0
+        if ds_avg < 1e-12:
+            continue
+        d2w[i] = (w[ip] - 2 * w[i] + w[im]) / (ds_avg * ds_avg)
+
+    # ── Find zero-crossings of dw (negative → positive = local minimum) ──
+    threshold = width_ratio * (np.median(w[w > 0]) if np.any(w > 0) else 1.0)
+
+    minima_indices = []
+    for i in range(n):
+        im = (i - 1) % n
+        if dw[im] < 0 and dw[i] >= 0 and d2w[i] > 0:
+            # Confirmed local minimum; check threshold
+            if 0 < w[i] < threshold:
+                minima_indices.append(i)
+
+    # ── Build result dicts ──
+    narrowings = []
+    for i in minima_indices:
+        narrowings.append({
+            'index': i,
+            'point': outline[i],
+            'opposite': outline[closest_idx[i]],
+            'width': float(w[i]),
+        })
+
+    # ── Deduplicate symmetric pairs ──
     if len(narrowings) > 1:
         deduped = []
         used_pairs = set()
         for nr in narrowings:
-            pair = tuple(sorted((nr['index'], int(np.argmin(
-                np.linalg.norm(outline - nr['opposite'], axis=1))))))
+            pair = tuple(sorted((nr['index'], int(closest_idx[nr['index']]))))
             if pair not in used_pairs:
                 used_pairs.add(pair)
                 deduped.append(nr)
