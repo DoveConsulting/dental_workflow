@@ -63,103 +63,242 @@ def project_mesh_to_plane(mesh: trimesh.Trimesh, num_samples: int = 10000) -> np
     return sampled[:, :2]
 
 
-# ── 4. Outline outer boundary (alpha shape) ──────────────────────────────
+# ── 4. Outline outer boundary ─────────────────────────────────────────────
 
-def alpha_shape_edges(points_2d: np.ndarray, alpha: float) -> list[tuple[int, int]]:
-    """Compute the alpha shape of a 2D point set and return boundary edges
-    as a list of (i, j) index pairs.
-
-    *alpha* controls concavity: smaller = more concave, larger = more convex.
-    If alpha is very large the result approaches the convex hull.
-    """
-    tri = Delaunay(points_2d)
-    edges = set()
-    edge_count = {}
-
-    for simplex in tri.simplices:
-        pts = points_2d[simplex]
-        # Circumradius of the triangle
-        a = np.linalg.norm(pts[0] - pts[1])
-        b = np.linalg.norm(pts[1] - pts[2])
-        c = np.linalg.norm(pts[2] - pts[0])
-        s = (a + b + c) / 2.0
-        area = np.sqrt(max(s * (s - a) * (s - b) * (s - c), 0))
-        if area < 1e-12:
-            continue
-        circum_r = (a * b * c) / (4.0 * area)
-
-        if circum_r < 1.0 / alpha:
-            for i in range(3):
-                edge = tuple(sorted((simplex[i], simplex[(i + 1) % 3])))
-                edge_count[edge] = edge_count.get(edge, 0) + 1
-
-    # Boundary edges appear exactly once in the filtered triangulation
-    boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
-    return boundary_edges
-
-
-def order_boundary(points_2d: np.ndarray, edges: list[tuple[int, int]]) -> np.ndarray:
-    """Order boundary edges into a closed polygon. Returns Mx2 ordered points.
-    If multiple loops exist, returns the longest one."""
+def _order_edges_into_loops(
+    edges: np.ndarray,
+    vertices: np.ndarray,
+) -> list[list[int]]:
+    """Order edges (Nx2 index pairs) into closed loops via adjacency walking.
+    Returns a list of loops, each loop being a list of vertex indices."""
     from collections import defaultdict
 
     adj = defaultdict(list)
-    for i, j in edges:
-        adj[i].append(j)
-        adj[j].append(i)
+    for e in edges:
+        adj[int(e[0])].append(int(e[1]))
+        adj[int(e[1])].append(int(e[0]))
 
-    visited_edges = set()
+    visited = set()
     loops = []
 
     for start in adj:
-        if start in visited_edges:
+        if start in visited:
             continue
         loop = [start]
-        visited_edges.add(start)
+        visited.add(start)
         current = start
         while True:
-            neighbors = adj[current]
             next_node = None
-            for n in neighbors:
-                if n not in visited_edges:
+            for n in adj[current]:
+                if n not in visited:
                     next_node = n
                     break
             if next_node is None:
                 break
             loop.append(next_node)
-            visited_edges.add(next_node)
+            visited.add(next_node)
             current = next_node
         loops.append(loop)
 
-    if not loops:
-        return np.empty((0, 2))
-
-    # Return the longest loop
-    longest = max(loops, key=len)
-    return points_2d[longest]
+    return loops
 
 
-def compute_outline(points_2d: np.ndarray, alpha: float = 1.0) -> np.ndarray:
-    """Compute the outer boundary outline of 2D points.
-    Returns Mx3 ordered boundary points with Z=0."""
-    edges = alpha_shape_edges(points_2d, alpha)
-    if not edges:
-        # Fallback: use convex hull
+def compute_mesh_outline(
+    mesh: trimesh.Trimesh,
+    alpha: float = 0.0,
+) -> np.ndarray:
+    """Compute the Z-projection outline of the mesh by projecting ALL mesh
+    vertices onto the XY plane and computing a concave hull (alpha shape).
+
+    If *alpha* <= 0 it is auto-computed from the mean projected edge length
+    so the result matches the mesh's triangle density without manual tuning.
+
+    Returns an Mx3 array of ordered boundary points with Z=0.
+    """
+    pts_2d = mesh.vertices[:, :2].copy()
+
+    # ── Auto-alpha from projected edge lengths ──
+    if alpha <= 0:
+        edges_unique = mesh.edges_unique
+        edge_vecs = pts_2d[edges_unique[:, 0]] - pts_2d[edges_unique[:, 1]]
+        edge_lens = np.linalg.norm(edge_vecs, axis=1)
+        mean_len = np.mean(edge_lens[edge_lens > 1e-10])
+        # alpha = 1 / max_circumradius.  Allow circumradii up to ~3× mean
+        # edge length so normal triangles pass, large gaps are excluded.
+        alpha = 1.0 / (3.0 * mean_len)
+
+    # ── Vectorised alpha-shape ──
+    tri = Delaunay(pts_2d)
+    simplices = tri.simplices
+
+    p0 = pts_2d[simplices[:, 0]]
+    p1 = pts_2d[simplices[:, 1]]
+    p2 = pts_2d[simplices[:, 2]]
+
+    a = np.linalg.norm(p0 - p1, axis=1)
+    b = np.linalg.norm(p1 - p2, axis=1)
+    c = np.linalg.norm(p2 - p0, axis=1)
+    s = (a + b + c) / 2.0
+    area = np.sqrt(np.maximum(s * (s - a) * (s - b) * (s - c), 0))
+
+    valid = area > 1e-12
+    circum_r = np.full(len(simplices), np.inf)
+    circum_r[valid] = (a[valid] * b[valid] * c[valid]) / (4.0 * area[valid])
+
+    keep = circum_r < 1.0 / alpha
+    kept = simplices[keep]
+
+    # ── Extract boundary edges (appear in exactly 1 kept triangle) ──
+    all_edges = np.vstack([
+        np.sort(kept[:, [0, 1]], axis=1),
+        np.sort(kept[:, [1, 2]], axis=1),
+        np.sort(kept[:, [0, 2]], axis=1),
+    ])
+    # Encode pairs as single int for fast counting (assumes < 2^31 verts)
+    keys = all_edges[:, 0].astype(np.int64) * (pts_2d.shape[0] + 1) + all_edges[:, 1]
+    unique_keys, inverse, counts = np.unique(keys, return_inverse=True,
+                                             return_counts=True)
+    boundary_mask = counts[inverse] == 1
+    boundary_edges = all_edges[boundary_mask]
+
+    if len(boundary_edges) == 0:
+        # Fallback to convex hull
         from scipy.spatial import ConvexHull
-        hull = ConvexHull(points_2d)
-        boundary_2d = points_2d[hull.vertices]
-    else:
-        boundary_2d = order_boundary(points_2d, edges)
+        hull = ConvexHull(pts_2d)
+        boundary_2d = pts_2d[hull.vertices]
+        return np.column_stack([boundary_2d, np.zeros(len(boundary_2d))])
 
-    if len(boundary_2d) == 0:
+    loops = _order_edges_into_loops(boundary_edges, pts_2d)
+    if not loops:
         return np.empty((0, 3))
 
-    # Close the loop
-    boundary_3d = np.column_stack([boundary_2d, np.zeros(len(boundary_2d))])
-    return boundary_3d
+    longest = max(loops, key=len)
+    boundary_2d = pts_2d[longest]
+    return np.column_stack([boundary_2d, np.zeros(len(boundary_2d))])
 
 
-# ── 5. Render outline as 3D curve ─────────────────────────────────────────
+# ── 5. Detect narrowing regions ───────────────────────────────────────────
+
+def find_narrowings(
+    outline: np.ndarray,
+    width_ratio: float = 0.5,
+    min_arc_gap: float = 0.25,
+    smooth_window: int = 5,
+) -> list[dict]:
+    """Find narrowing regions along the closed outline curve.
+
+    For each outline point, the "local width" is the distance to the closest
+    point on the opposite side of the curve (excluding neighbours within
+    *min_arc_gap* fraction of the total arc length on each side).
+
+    A narrowing is a local minimum of the width profile whose value is below
+    *width_ratio* × the median width.
+
+    Returns a list of dicts with keys:
+        'index'  – index into *outline*
+        'point'  – the outline point at the narrowing
+        'opposite' – the closest opposing outline point
+        'width'  – the local width value
+    """
+    n = len(outline)
+    if n < 6:
+        return []
+
+    # Cumulative arc length (closed loop)
+    diffs = np.diff(outline, axis=0)
+    seg_lens = np.linalg.norm(diffs, axis=1)
+    # Add closing segment
+    close_len = np.linalg.norm(outline[0] - outline[-1])
+    all_lens = np.append(seg_lens, close_len)
+    arc = np.concatenate([[0], np.cumsum(all_lens)])
+    total_arc = arc[-1]
+    gap = min_arc_gap * total_arc
+
+    # For each point, find the closest non-adjacent point
+    widths = np.full(n, np.inf)
+    closest_idx = np.zeros(n, dtype=int)
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # Arc distance along the curve (shorter path around the loop)
+            d_arc_fwd = abs(arc[j] - arc[i])
+            d_arc = min(d_arc_fwd, total_arc - d_arc_fwd)
+            if d_arc < gap:
+                continue
+            d_eucl = np.linalg.norm(outline[i] - outline[j])
+            if d_eucl < widths[i]:
+                widths[i] = d_eucl
+                closest_idx[i] = j
+
+    # Replace inf with 0 (points with no valid opposite)
+    widths[widths == np.inf] = 0
+
+    # Smooth the width profile
+    if smooth_window > 1 and n > smooth_window:
+        kernel = np.ones(smooth_window) / smooth_window
+        # Pad for circular smoothing
+        padded = np.concatenate([widths[-smooth_window:], widths, widths[:smooth_window]])
+        smoothed = np.convolve(padded, kernel, mode='same')
+        widths_smooth = smoothed[smooth_window:smooth_window + n]
+    else:
+        widths_smooth = widths.copy()
+
+    # Threshold: narrowings must be below width_ratio × median
+    median_w = np.median(widths_smooth[widths_smooth > 0]) if np.any(widths_smooth > 0) else 1.0
+    threshold = width_ratio * median_w
+
+    # Find local minima of smoothed width profile
+    narrowings = []
+    for i in range(n):
+        if widths_smooth[i] <= 0 or widths_smooth[i] > threshold:
+            continue
+        prev_idx = (i - 1) % n
+        next_idx = (i + 1) % n
+        if widths_smooth[i] <= widths_smooth[prev_idx] and widths_smooth[i] <= widths_smooth[next_idx]:
+            narrowings.append({
+                'index': i,
+                'point': outline[i],
+                'opposite': outline[closest_idx[i]],
+                'width': float(widths_smooth[i]),
+            })
+
+    # Deduplicate: if two narrowings point to each other, keep the one with
+    # the smaller width
+    if len(narrowings) > 1:
+        deduped = []
+        used_pairs = set()
+        for nr in narrowings:
+            pair = tuple(sorted((nr['index'], int(np.argmin(
+                np.linalg.norm(outline - nr['opposite'], axis=1))))))
+            if pair not in used_pairs:
+                used_pairs.add(pair)
+                deduped.append(nr)
+        narrowings = deduped
+
+    return narrowings
+
+
+def make_narrowing_geometry(narrowings: list[dict]) -> o3d.geometry.LineSet:
+    """Return a LineSet with lines drawn across each narrowing region."""
+    points = []
+    lines = []
+    for nr in narrowings:
+        idx = len(points)
+        points.append(nr['point'])
+        points.append(nr['opposite'])
+        lines.append([idx, idx + 1])
+
+    ls = o3d.geometry.LineSet()
+    if points:
+        ls.points = o3d.utility.Vector3dVector(np.array(points))
+        ls.lines = o3d.utility.Vector2iVector(np.array(lines))
+        ls.paint_uniform_color([1.0, 0.2, 0.2])
+    return ls
+
+
+# ── 6. Render outline as 3D curve ─────────────────────────────────────────
 
 def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     o3d_mesh = o3d.geometry.TriangleMesh()
@@ -241,7 +380,8 @@ class OutlineApp:
     """Open3D GUI application for computing and displaying the outer boundary."""
 
     def __init__(self, stl_path: str | None = None, alpha: float = 1.0,
-                 num_samples: int = 10000, wireframe: bool = False):
+                 num_samples: int = 10000, wireframe: bool = False,
+                 width_ratio: float = 0.5, min_arc_gap: float = 0.25):
         self._mesh: trimesh.Trimesh | None = None
         self._outline: np.ndarray | None = None
 
@@ -307,6 +447,31 @@ class OutlineApp:
         self._show_points_cb = gui.Checkbox("Show projected points")
         self._show_points_cb.checked = False
         self._panel.add_child(self._show_points_cb)
+
+        self._show_plane_cb = gui.Checkbox("Show Z=0 plane")
+        self._show_plane_cb.checked = True
+        self._panel.add_child(self._show_plane_cb)
+
+        self._show_narrowings_cb = gui.Checkbox("Show narrowings")
+        self._show_narrowings_cb.checked = True
+        self._panel.add_child(self._show_narrowings_cb)
+
+        sep3 = gui.Label("─── Narrowing ───")
+        self._panel.add_child(sep3)
+
+        # Width ratio
+        self._panel.add_child(gui.Label("Width ratio"))
+        self._width_ratio_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._width_ratio_edit.double_value = width_ratio
+        self._width_ratio_edit.set_limits(0.01, 2.0)
+        self._panel.add_child(self._width_ratio_edit)
+
+        # Min arc gap
+        self._panel.add_child(gui.Label("Min arc gap"))
+        self._min_arc_gap_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._min_arc_gap_edit.double_value = min_arc_gap
+        self._min_arc_gap_edit.set_limits(0.05, 0.49)
+        self._panel.add_child(self._min_arc_gap_edit)
 
         # Recompute button
         sep2 = gui.Label("")
@@ -392,13 +557,31 @@ class OutlineApp:
                 mat.line_width = 1.0
             scene.add_geometry("mesh", geom, mat)
 
-        # Project and compute outline
-        pts_2d = project_mesh_to_plane(mesh, num_samples=num_samples)
-        outline = compute_outline(pts_2d, alpha=alpha)
+        # Z=0 reference plane
+        if self._show_plane_cb.checked:
+            margin = 2.0
+            xmin, ymin = mesh.vertices[:, 0].min() - margin, mesh.vertices[:, 1].min() - margin
+            xmax, ymax = mesh.vertices[:, 0].max() + margin, mesh.vertices[:, 1].max() + margin
+            corners = np.array([
+                [xmin, ymin, 0], [xmax, ymin, 0],
+                [xmax, ymax, 0], [xmin, ymax, 0],
+            ])
+            plane_mesh = o3d.geometry.TriangleMesh()
+            plane_mesh.vertices = o3d.utility.Vector3dVector(corners)
+            plane_mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [0, 2, 3]])
+            plane_mesh.compute_vertex_normals()
+            mat_plane = o3d.visualization.rendering.MaterialRecord()
+            mat_plane.shader = "defaultLitTransparency"
+            mat_plane.base_color = [1.0, 1.0, 0.0, 0.25]
+            scene.add_geometry("z0_plane", plane_mesh, mat_plane)
+
+        # Compute outline from all mesh vertices projected to XY
+        outline = compute_mesh_outline(mesh, alpha=alpha)
         self._outline = outline
 
-        # Projected points
+        # Projected points (optional visualisation)
         if self._show_points_cb.checked:
+            pts_2d = project_mesh_to_plane(mesh, num_samples=num_samples)
             pts_3d = np.column_stack([pts_2d, np.zeros(len(pts_2d))])
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(pts_3d)
@@ -416,7 +599,23 @@ class OutlineApp:
             mat_o.base_color = [0.0, 1.0, 0.3, 1.0]
             scene.add_geometry("outline", tube, mat_o)
 
-        self._status_label.text = f"{len(pts_2d)} pts, {len(outline)} boundary pts"
+        # Narrowing lines
+        if self._show_narrowings_cb.checked and len(outline) > 5:
+            width_ratio = self._width_ratio_edit.double_value
+            min_arc_gap = self._min_arc_gap_edit.double_value
+            narrowings = find_narrowings(outline, width_ratio=width_ratio,
+                                         min_arc_gap=min_arc_gap)
+            ls = make_narrowing_geometry(narrowings)
+            if len(narrowings) > 0:
+                mat_n = o3d.visualization.rendering.MaterialRecord()
+                mat_n.shader = "unlitLine"
+                mat_n.line_width = 3.0
+                scene.add_geometry("narrowings", ls, mat_n)
+            self._status_label.text = (
+                f"{len(outline)} boundary, "
+                f"{len(narrowings)} narrowings")
+        else:
+            self._status_label.text = f"{len(outline)} boundary pts"
 
         # Fit camera
         bounds = scene.bounding_box
@@ -439,6 +638,10 @@ def main():
                         help="Number of surface samples (default: 10000)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe")
+    parser.add_argument("--width-ratio", type=float, default=0.5,
+                        help="Width ratio threshold for narrowings (default: 0.5)")
+    parser.add_argument("--min-arc-gap", type=float, default=0.25,
+                        help="Min arc-length fraction to skip neighbours (default: 0.25)")
     args = parser.parse_args()
 
     app = OutlineApp(
@@ -446,6 +649,8 @@ def main():
         alpha=args.alpha,
         num_samples=args.num_samples,
         wireframe=args.wireframe,
+        width_ratio=args.width_ratio,
+        min_arc_gap=args.min_arc_gap,
     )
     app.run()
 
