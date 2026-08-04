@@ -248,10 +248,14 @@ def find_connectors(
     threshold_ratio: float = 0.85,
     skip_extremes: bool = True,
     neighbor_distance: float = 10.0,
+    height_method: str = "max",
 ) -> list[list[dict]]:
     """Identify connector regions: consecutive runs of planes where the
     maximum vertical distance from the cross-section to the occlusal curve
-    falls below *threshold_ratio* × the local median distance.
+    falls below *threshold_ratio* × the local reference distance.
+
+    *height_method* controls how the local reference is computed from
+    neighboring planes: "median" uses the median, "max" uses the maximum.
 
     The local median is computed from neighboring planes within
     *neighbor_distance* units along the curve (equally divided left/right).
@@ -292,7 +296,10 @@ def find_connectors(
         right = arc_pos[i] + half
         mask = (arc_pos >= left) & (arc_pos <= right) & (distances > 0)
         if mask.any():
-            local_median = np.median(distances[mask])
+            if height_method == "max":
+                local_median = np.max(distances[mask])
+            else:
+                local_median = np.median(distances[mask])
         else:
             local_median = 1.0
         threshold = threshold_ratio * local_median
@@ -529,6 +536,13 @@ class OcclusalApp:
         self._neighbor_dist_edit.set_limits(0.1, 1000.0)
         self._panel.add_child(self._neighbor_dist_edit)
 
+        # Height method
+        self._panel.add_child(gui.Label("Height method"))
+        self._height_max_rb = gui.RadioButton(gui.RadioButton.VERT)
+        self._height_max_rb.set_items(["Max", "Median"])
+        self._height_max_rb.selected_index = 0
+        self._panel.add_child(self._height_max_rb)
+
         # Skip extremes
         self._skip_extremes_cb = gui.Checkbox("Skip extremes")
         self._skip_extremes_cb.checked = skip_extremes
@@ -665,10 +679,12 @@ class OcclusalApp:
         planes = create_slicing_planes(curve, spacing=spacing,
                                        plane_half_size=plane_size)
 
+        height_method = "median" if self._height_max_rb.selected_index == 1 else "max"
         connectors = find_connectors(mesh, planes,
                                      threshold_ratio=threshold_ratio,
                                      skip_extremes=skip_extremes,
-                                     neighbor_distance=neighbor_distance)
+                                     neighbor_distance=neighbor_distance,
+                                     height_method=height_method)
         connector_indices = set()
         for group in connectors:
             for pl in group:
