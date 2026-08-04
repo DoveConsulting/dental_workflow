@@ -363,11 +363,15 @@ def make_connectors_geometry(
         d_first = mesh.vertices @ normal_first - origin_first @ normal_first
         d_last = mesh.vertices @ normal_last - origin_last @ normal_last
 
-        # Vertices between the two planes
-        inside = (d_first >= 0) & (d_last <= 0)
-        if not inside.any():
-            # Try flipping
-            inside = (d_first <= 0) & (d_last >= 0)
+        if len(group) == 1:
+            # Single plane: keep vertices within a small distance of the plane
+            inside = np.abs(d_first) <= (np.linalg.norm(origin_first) * 0.01 + 0.5)
+        else:
+            # Vertices between the two planes
+            inside = (d_first >= 0) & (d_last <= 0)
+            if not inside.any():
+                # Try flipping
+                inside = (d_first <= 0) & (d_last >= 0)
 
         if inside.any():
             connector_points.append(mesh.vertices[inside])
@@ -391,9 +395,12 @@ def make_connectors_geometry(
         d_first = sampled @ normal_first - origin_first @ normal_first
         d_last = sampled @ normal_last - origin_last @ normal_last
 
-        slab = (d_first >= 0) & (d_last <= 0)
-        if not slab.any():
-            slab = (d_first <= 0) & (d_last >= 0)
+        if len(group) == 1:
+            slab = np.abs(d_first) <= (np.linalg.norm(origin_first) * 0.01 + 0.5)
+        else:
+            slab = (d_first >= 0) & (d_last <= 0)
+            if not slab.any():
+                slab = (d_first <= 0) & (d_last >= 0)
         keep |= slab
 
     if keep.any():
