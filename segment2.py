@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import open3d as o3d
 import trimesh
-from scipy.spatial import Delaunay
+from scipy.ndimage import binary_dilation, binary_erosion
 
 
 # ── 1. Load STL ──────────────────────────────────────────────────────────
@@ -65,116 +65,95 @@ def project_mesh_to_plane(mesh: trimesh.Trimesh, num_samples: int = 10000) -> np
 
 # ── 4. Outline outer boundary ─────────────────────────────────────────────
 
-def _order_edges_into_loops(
-    edges: np.ndarray,
-    vertices: np.ndarray,
-) -> list[list[int]]:
-    """Order edges (Nx2 index pairs) into closed loops via adjacency walking.
-    Returns a list of loops, each loop being a list of vertex indices."""
-    from collections import defaultdict
-
-    adj = defaultdict(list)
-    for e in edges:
-        adj[int(e[0])].append(int(e[1]))
-        adj[int(e[1])].append(int(e[0]))
-
-    visited = set()
-    loops = []
-
-    for start in adj:
-        if start in visited:
-            continue
-        loop = [start]
-        visited.add(start)
-        current = start
-        while True:
-            next_node = None
-            for n in adj[current]:
-                if n not in visited:
-                    next_node = n
-                    break
-            if next_node is None:
-                break
-            loop.append(next_node)
-            visited.add(next_node)
-            current = next_node
-        loops.append(loop)
-
-    return loops
-
-
 def compute_mesh_outline(
     mesh: trimesh.Trimesh,
-    alpha: float = 0.0,
+    grid_res: float = 0.1,
 ) -> np.ndarray:
-    """Compute the Z-projection outline of the mesh by projecting ALL mesh
-    vertices onto the XY plane and computing a concave hull (alpha shape).
+    """Compute the Z-projection outline by rasterising all mesh vertices
+    onto a 2D grid, closing small gaps, and tracing the outer contour.
 
-    If *alpha* <= 0 it is auto-computed from the mean projected edge length
-    so the result matches the mesh's triangle density without manual tuning.
+    *grid_res* is the cell size (mm).  Smaller = more detail, larger = smoother.
 
     Returns an Mx3 array of ordered boundary points with Z=0.
     """
-    pts_2d = mesh.vertices[:, :2].copy()
+    pts_2d = mesh.vertices[:, :2]
 
-    # ── Auto-alpha from projected edge lengths ──
-    if alpha <= 0:
-        edges_unique = mesh.edges_unique
-        edge_vecs = pts_2d[edges_unique[:, 0]] - pts_2d[edges_unique[:, 1]]
-        edge_lens = np.linalg.norm(edge_vecs, axis=1)
-        mean_len = np.mean(edge_lens[edge_lens > 1e-10])
-        # alpha = 1 / max_circumradius.  Allow circumradii up to ~3× mean
-        # edge length so normal triangles pass, large gaps are excluded.
-        alpha = 1.0 / (3.0 * mean_len)
+    pad = grid_res * 3
+    xmin, ymin = pts_2d.min(axis=0) - pad
+    xmax, ymax = pts_2d.max(axis=0) + pad
 
-    # ── Vectorised alpha-shape ──
-    tri = Delaunay(pts_2d)
-    simplices = tri.simplices
+    nx = int(np.ceil((xmax - xmin) / grid_res)) + 1
+    ny = int(np.ceil((ymax - ymin) / grid_res)) + 1
 
-    p0 = pts_2d[simplices[:, 0]]
-    p1 = pts_2d[simplices[:, 1]]
-    p2 = pts_2d[simplices[:, 2]]
+    # Rasterise vertices onto the grid
+    xi = ((pts_2d[:, 0] - xmin) / grid_res).astype(int)
+    yi = ((pts_2d[:, 1] - ymin) / grid_res).astype(int)
+    xi = np.clip(xi, 0, nx - 1)
+    yi = np.clip(yi, 0, ny - 1)
 
-    a = np.linalg.norm(p0 - p1, axis=1)
-    b = np.linalg.norm(p1 - p2, axis=1)
-    c = np.linalg.norm(p2 - p0, axis=1)
-    s = (a + b + c) / 2.0
-    area = np.sqrt(np.maximum(s * (s - a) * (s - b) * (s - c), 0))
+    grid = np.zeros((ny, nx), dtype=bool)
+    grid[yi, xi] = True
 
-    valid = area > 1e-12
-    circum_r = np.full(len(simplices), np.inf)
-    circum_r[valid] = (a[valid] * b[valid] * c[valid]) / (4.0 * area[valid])
+    # Morphological close to fill small interior gaps
+    struct = np.ones((3, 3), dtype=bool)
+    grid = binary_dilation(grid, structure=struct, iterations=2)
+    grid = binary_erosion(grid, structure=struct, iterations=2)
 
-    keep = circum_r < 1.0 / alpha
-    kept = simplices[keep]
+    # Boundary = filled cells with at least one empty 4-neighbour
+    interior = binary_erosion(grid, structure=np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=bool))
+    boundary = grid & ~interior
 
-    # ── Extract boundary edges (appear in exactly 1 kept triangle) ──
-    all_edges = np.vstack([
-        np.sort(kept[:, [0, 1]], axis=1),
-        np.sort(kept[:, [1, 2]], axis=1),
-        np.sort(kept[:, [0, 2]], axis=1),
-    ])
-    # Encode pairs as single int for fast counting (assumes < 2^31 verts)
-    keys = all_edges[:, 0].astype(np.int64) * (pts_2d.shape[0] + 1) + all_edges[:, 1]
-    unique_keys, inverse, counts = np.unique(keys, return_inverse=True,
-                                             return_counts=True)
-    boundary_mask = counts[inverse] == 1
-    boundary_edges = all_edges[boundary_mask]
-
-    if len(boundary_edges) == 0:
-        # Fallback to convex hull
-        from scipy.spatial import ConvexHull
-        hull = ConvexHull(pts_2d)
-        boundary_2d = pts_2d[hull.vertices]
-        return np.column_stack([boundary_2d, np.zeros(len(boundary_2d))])
-
-    loops = _order_edges_into_loops(boundary_edges, pts_2d)
-    if not loops:
+    by, bx = np.where(boundary)
+    if len(bx) == 0:
         return np.empty((0, 3))
 
-    longest = max(loops, key=len)
-    boundary_2d = pts_2d[longest]
-    return np.column_stack([boundary_2d, np.zeros(len(boundary_2d))])
+    boundary_xy = np.column_stack([
+        xmin + bx * grid_res,
+        ymin + by * grid_res,
+    ])
+
+    # Order boundary points by nearest-neighbour walk
+    ordered = _order_nearest_neighbour(boundary_xy)
+    return np.column_stack([ordered, np.zeros(len(ordered))])
+
+
+def _order_nearest_neighbour(pts: np.ndarray) -> np.ndarray:
+    """Order 2D points into a loop via greedy nearest-neighbour walk."""
+    from scipy.spatial import cKDTree
+
+    n = len(pts)
+    if n < 3:
+        return pts
+
+    tree = cKDTree(pts)
+    visited = np.zeros(n, dtype=bool)
+
+    # Start from the point with smallest x
+    start = int(np.argmin(pts[:, 0]))
+    order = [start]
+    visited[start] = True
+
+    for _ in range(n - 1):
+        cur = order[-1]
+        # Query enough neighbours to find an unvisited one
+        k = min(32, n)
+        dists, idxs = tree.query(pts[cur], k=k)
+        found = False
+        for idx in idxs:
+            if not visited[idx]:
+                order.append(int(idx))
+                visited[idx] = True
+                found = True
+                break
+        if not found:
+            # Brute-force fallback
+            d = np.linalg.norm(pts - pts[cur], axis=1)
+            d[visited] = np.inf
+            nxt = int(np.argmin(d))
+            order.append(nxt)
+            visited[nxt] = True
+
+    return pts[order]
 
 
 # ── 5. Detect narrowing regions ───────────────────────────────────────────
@@ -379,7 +358,7 @@ def make_outline_geometry(outline: np.ndarray, radius: float = 0.15) -> o3d.geom
 class OutlineApp:
     """Open3D GUI application for computing and displaying the outer boundary."""
 
-    def __init__(self, stl_path: str | None = None, alpha: float = 1.0,
+    def __init__(self, stl_path: str | None = None, grid_res: float = 0.1,
                  num_samples: int = 10000, wireframe: bool = False,
                  width_ratio: float = 0.5, min_arc_gap: float = 0.25):
         self._mesh: trimesh.Trimesh | None = None
@@ -416,12 +395,12 @@ class OutlineApp:
         sep = gui.Label("─── Parameters ───")
         self._panel.add_child(sep)
 
-        # Alpha
-        self._panel.add_child(gui.Label("Alpha"))
-        self._alpha_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
-        self._alpha_edit.double_value = alpha
-        self._alpha_edit.set_limits(0.01, 100.0)
-        self._panel.add_child(self._alpha_edit)
+        # Grid resolution
+        self._panel.add_child(gui.Label("Grid resolution"))
+        self._grid_res_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._grid_res_edit.double_value = grid_res
+        self._grid_res_edit.set_limits(0.05, 5.0)
+        self._panel.add_child(self._grid_res_edit)
 
         # Num samples
         self._panel.add_child(gui.Label("Num samples"))
@@ -445,7 +424,7 @@ class OutlineApp:
         self._panel.add_child(self._show_outline_cb)
 
         self._show_points_cb = gui.Checkbox("Show projected points")
-        self._show_points_cb.checked = False
+        self._show_points_cb.checked = True
         self._panel.add_child(self._show_points_cb)
 
         self._show_plane_cb = gui.Checkbox("Show Z=0 plane")
@@ -542,7 +521,7 @@ class OutlineApp:
         scene.clear_geometry()
 
         mesh = self._mesh
-        alpha = self._alpha_edit.double_value
+        grid_res = self._grid_res_edit.double_value
         num_samples = self._num_samples_edit.int_value
         wireframe = self._wireframe_cb.checked
 
@@ -575,8 +554,8 @@ class OutlineApp:
             mat_plane.base_color = [1.0, 1.0, 0.0, 0.25]
             scene.add_geometry("z0_plane", plane_mesh, mat_plane)
 
-        # Compute outline from all mesh vertices projected to XY
-        outline = compute_mesh_outline(mesh, alpha=alpha)
+        # Compute outline from rasterised vertex projection
+        outline = compute_mesh_outline(mesh, grid_res=grid_res)
         self._outline = outline
 
         # Projected points (optional visualisation)
@@ -632,21 +611,21 @@ def main():
         description="Outer boundary outline of dental STL")
     parser.add_argument("stl", nargs="?", default=None,
                         help="Path to the input STL file (optional; can load from GUI)")
-    parser.add_argument("--alpha", type=float, default=1.0,
-                        help="Alpha parameter for concave hull (default: 1.0)")
+    parser.add_argument("--grid-res", type=float, default=0.1,
+                        help="Grid cell size for outline extraction in mm (default: 0.1)")
     parser.add_argument("--num-samples", type=int, default=10000,
                         help="Number of surface samples (default: 10000)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe")
-    parser.add_argument("--width-ratio", type=float, default=0.5,
-                        help="Width ratio threshold for narrowings (default: 0.5)")
-    parser.add_argument("--min-arc-gap", type=float, default=0.25,
-                        help="Min arc-length fraction to skip neighbours (default: 0.25)")
+    parser.add_argument("--width-ratio", type=float, default=0.9,
+                        help="Width ratio threshold for narrowings (default: 0.9)")
+    parser.add_argument("--min-arc-gap", type=float, default=0.1,
+                        help="Min arc-length fraction to skip neighbours (default: 0.1)")
     args = parser.parse_args()
 
     app = OutlineApp(
         stl_path=args.stl,
-        alpha=args.alpha,
+        grid_res=args.grid_res,
         num_samples=args.num_samples,
         wireframe=args.wireframe,
         width_ratio=args.width_ratio,
