@@ -741,6 +741,12 @@ class OutlineApp:
         scene = self._scene.scene
         scene.clear_geometry()
 
+        # Origin triad (XYZ axes)
+        triad = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        mat_triad = o3d.visualization.rendering.MaterialRecord()
+        mat_triad.shader = "defaultUnlit"
+        scene.add_geometry("triad", triad, mat_triad)
+
         mesh = self._mesh
         grid_res = self._grid_res_edit.double_value
         num_samples = self._num_samples_edit.int_value
