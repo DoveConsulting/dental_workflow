@@ -418,6 +418,68 @@ def make_narrowing_geometry(narrowings: list[dict]) -> o3d.geometry.LineSet:
     return ls
 
 
+def compute_narrowing_sections(
+    mesh: trimesh.Trimesh,
+    narrowings: list[dict],
+) -> list[np.ndarray]:
+    """Slice the mesh with a vertical plane at each narrowing to produce
+    cross-section contours that loop around the mesh surface.
+
+    The cutting plane contains the narrowing line (point ↔ opposite)
+    and the Z axis.  Its normal is the cross product of the narrowing
+    direction with Z.
+    """
+    sections = []
+
+    for nr in narrowings:
+        direction = nr['opposite'] - nr['point']
+        direction_2d = direction[:2]
+        d_len = np.linalg.norm(direction_2d)
+        if d_len < 1e-12:
+            continue
+        # normal = direction × Z  →  lies in XY, perpendicular to the narrowing line
+        plane_normal = np.array([direction_2d[1], -direction_2d[0], 0.0]) / d_len
+
+        # Plane origin at the midpoint between the narrowing pair
+        origin = (nr['point'] + nr['opposite']) / 2.0
+
+        section = mesh.section(
+            plane_origin=origin,
+            plane_normal=plane_normal,
+        )
+        if section is None:
+            continue
+
+        try:
+            for path_pts in section.discrete:
+                if len(path_pts) >= 3:
+                    sections.append(np.array(path_pts))
+        except Exception:
+            pass
+
+    return sections
+
+
+def make_narrowing_rings_geometry(
+    sections: list[np.ndarray],
+) -> list[o3d.geometry.LineSet]:
+    """Create LineSet geometry for cross-section rings at narrowings."""
+    geometries = []
+    for pts in sections:
+        m = len(pts)
+        if m < 3:
+            continue
+        lines = [[i, (i + 1) % m] for i in range(m)]
+
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(pts)
+        ls.lines = o3d.utility.Vector2iVector(np.array(lines))
+        ls.paint_uniform_color([1.0, 1.0, 0.0])
+        geometries.append(ls)
+
+    return geometries
+
+
 # ── 6. Render outline as 3D curve ─────────────────────────────────────────
 
 def _trimesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
@@ -576,6 +638,10 @@ class OutlineApp:
         self._show_narrowings_cb.checked = True
         self._panel.add_child(self._show_narrowings_cb)
 
+        self._show_rings_cb = gui.Checkbox("Show narrowing rings")
+        self._show_rings_cb.checked = True
+        self._panel.add_child(self._show_rings_cb)
+
         sep3 = gui.Label("─── Narrowing ───")
         self._panel.add_child(sep3)
 
@@ -719,18 +785,31 @@ class OutlineApp:
             mat_o.base_color = [0.0, 1.0, 0.3, 1.0]
             scene.add_geometry("outline", tube, mat_o)
 
-        # Narrowing lines
-        if self._show_narrowings_cb.checked and len(outline) > 5:
+        # Narrowings
+        if (self._show_narrowings_cb.checked or self._show_rings_cb.checked) and len(outline) > 5:
             min_prominence = self._min_prom_edit.double_value
             min_arc_gap = self._min_arc_gap_edit.double_value
             narrowings = find_narrowings(outline, min_prominence=min_prominence,
                                          min_arc_gap=min_arc_gap)
-            ls = make_narrowing_geometry(narrowings)
-            if len(narrowings) > 0:
+
+            # Narrowing lines
+            if self._show_narrowings_cb.checked and len(narrowings) > 0:
+                ls = make_narrowing_geometry(narrowings)
                 mat_n = o3d.visualization.rendering.MaterialRecord()
                 mat_n.shader = "unlitLine"
                 mat_n.line_width = 3.0
                 scene.add_geometry("narrowings", ls, mat_n)
+
+            # Narrowing rings (cross-section contours around mesh)
+            if self._show_rings_cb.checked and len(narrowings) > 0:
+                sections = compute_narrowing_sections(mesh, narrowings)
+                ring_geoms = make_narrowing_rings_geometry(sections)
+                for i, rg in enumerate(ring_geoms):
+                    mat_r = o3d.visualization.rendering.MaterialRecord()
+                    mat_r.shader = "unlitLine"
+                    mat_r.line_width = 4.0
+                    scene.add_geometry(f"ring_{i}", rg, mat_r)
+
             self._status_label.text = (
                 f"{len(outline)} boundary, "
                 f"{len(narrowings)} narrowings")
@@ -758,8 +837,8 @@ def main():
                         help="Number of surface samples (default: 10000)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe")
-    parser.add_argument("--min-prominence", type=float, default=0.5,
-                        help="Min prominence (mm) for narrowing detection (default: 0.5)")
+    parser.add_argument("--min-prominence", type=float, default=0.7,
+                        help="Min prominence (mm) for narrowing detection (default: 0.7)")
     parser.add_argument("--min-arc-gap", type=float, default=0.1,
                         help="Min arc-length fraction to skip neighbours (default: 0.1)")
     args = parser.parse_args()
