@@ -576,6 +576,7 @@ class OutlineApp:
                  min_prominence: float = 0.7, min_arc_gap: float = 0.25):
         self._mesh: trimesh.Trimesh | None = None
         self._outline: np.ndarray | None = None
+        self._camera_initialized = False
 
         gui = o3d.visualization.gui
         self._gui = gui
@@ -826,9 +827,11 @@ class OutlineApp:
         else:
             self._status_label.text = f"{len(outline)} boundary pts"
 
-        # Fit camera
-        bounds = scene.bounding_box
-        self._scene.setup_camera(60.0, bounds, bounds.get_center())
+        # Fit camera only on first load
+        if not self._camera_initialized:
+            bounds = scene.bounding_box
+            self._scene.setup_camera(60.0, bounds, bounds.get_center())
+            self._camera_initialized = True
 
     def run(self):
         self._app.run()
