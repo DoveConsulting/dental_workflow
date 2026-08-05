@@ -86,19 +86,40 @@ def compute_mesh_outline(
     nx = int(np.ceil((xmax - xmin) / grid_res)) + 1
     ny = int(np.ceil((ymax - ymin) / grid_res)) + 1
 
-    # Rasterise vertices onto the grid
-    xi = ((pts_2d[:, 0] - xmin) / grid_res).astype(int)
-    yi = ((pts_2d[:, 1] - ymin) / grid_res).astype(int)
-    xi = np.clip(xi, 0, nx - 1)
-    yi = np.clip(yi, 0, ny - 1)
+    # Rasterise all mesh edges onto the grid (not just vertices)
+    # This ensures continuous fill even where triangles are large.
+    edges = mesh.edges_unique
+    p0 = pts_2d[edges[:, 0]]
+    p1 = pts_2d[edges[:, 1]]
+    lengths = np.linalg.norm(p1 - p0, axis=1)
+    max_steps = max(int(np.ceil(lengths.max() / grid_res)), 1)
 
     grid = np.zeros((ny, nx), dtype=bool)
-    grid[yi, xi] = True
+    for step in range(max_steps + 1):
+        t = step / max_steps
+        pts_interp = p0 + t * (p1 - p0)
+        gx = ((pts_interp[:, 0] - xmin) / grid_res).astype(int)
+        gy = ((pts_interp[:, 1] - ymin) / grid_res).astype(int)
+        valid = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+        grid[gy[valid], gx[valid]] = True
 
-    # Morphological close to fill small interior gaps
+    # Fill interior holes enclosed by the rasterised edges
+    from scipy.ndimage import binary_fill_holes
+    grid = binary_fill_holes(grid)
+
+    # Morphological close to smooth jagged boundary
     struct = np.ones((3, 3), dtype=bool)
-    grid = binary_dilation(grid, structure=struct, iterations=2)
-    grid = binary_erosion(grid, structure=struct, iterations=2)
+    grid = binary_dilation(grid, structure=struct, iterations=1)
+    grid = binary_erosion(grid, structure=struct, iterations=1)
+
+    # Keep only the largest connected component
+    from scipy.ndimage import label as ndlabel
+    labeled, num_features = ndlabel(grid)
+    if num_features > 1:
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0  # ignore background
+        largest = sizes.argmax()
+        grid = labeled == largest
 
     # Trace outer contour on the filled grid using Moore boundary tracing
     contour_rc = _trace_outer_contour(grid)
