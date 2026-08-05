@@ -224,7 +224,7 @@ def _trace_outer_contour(grid: np.ndarray) -> np.ndarray:
 
 def find_narrowings(
     outline: np.ndarray,
-    width_ratio: float = 0.5,
+    width_ratio: float = 1.0,
     min_arc_gap: float = 0.25,
     sigma: float = 3.0,
 ) -> list[dict]:
@@ -453,7 +453,7 @@ class OutlineApp:
 
     def __init__(self, stl_path: str | None = None, grid_res: float = 0.1,
                  num_samples: int = 10000, wireframe: bool = False,
-                 width_ratio: float = 0.5, min_arc_gap: float = 0.25):
+                 width_ratio: float = 1.0, min_arc_gap: float = 0.25):
         self._mesh: trimesh.Trimesh | None = None
         self._outline: np.ndarray | None = None
 
@@ -710,8 +710,8 @@ def main():
                         help="Number of surface samples (default: 10000)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe")
-    parser.add_argument("--width-ratio", type=float, default=0.9,
-                        help="Width ratio threshold for narrowings (default: 0.9)")
+    parser.add_argument("--width-ratio", type=float, default=1.0,
+                        help="Width ratio threshold for narrowings (default: 1.0)")
     parser.add_argument("--min-arc-gap", type=float, default=0.1,
                         help="Min arc-length fraction to skip neighbours (default: 0.1)")
     args = parser.parse_args()
