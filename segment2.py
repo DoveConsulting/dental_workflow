@@ -450,10 +450,20 @@ def compute_narrowing_sections(
         if section is None:
             continue
 
+        # Pick only the discrete path closest to the narrowing midpoint
         try:
+            best_path = None
+            best_dist = np.inf
             for path_pts in section.discrete:
-                if len(path_pts) >= 3:
-                    sections.append(np.array(path_pts))
+                if len(path_pts) < 3:
+                    continue
+                centroid = np.mean(path_pts, axis=0)
+                dist = np.linalg.norm(centroid - origin)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_path = np.array(path_pts)
+            if best_path is not None:
+                sections.append(best_path)
         except Exception:
             pass
 
