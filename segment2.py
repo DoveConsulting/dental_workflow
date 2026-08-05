@@ -36,21 +36,25 @@ def load_mesh(filepath: str) -> trimesh.Trimesh:
 # ── 2. Align mesh ────────────────────────────────────────────────────────
 
 def align_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Translate centroid to origin, then PCA-rotate so the widest spread
-    falls on X, second-widest on Y, and the thinnest on Z."""
-    centroid = mesh.vertices.mean(axis=0)
-    mesh.vertices -= centroid
+    """Align mesh using the oriented bounding box (OBB).
 
-    cov = np.cov(mesh.vertices, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    The OBB finds the minimum-volume axis-aligned box for the mesh.
+    After applying the OBB transform, axes are reordered so the widest
+    extent falls on X, second-widest on Y, and thinnest on Z.
+    """
+    to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+    R = to_origin[:3, :3]
+    t = to_origin[:3, 3]
+    mesh.vertices = mesh.vertices @ R.T + t
 
-    order = np.argsort(-eigenvalues)
-    rotation = eigenvectors[:, order].T
+    # Verify axis ordering and fix: widest→X, thinnest→Z
+    actual_extents = np.ptp(mesh.vertices, axis=0)
+    order = np.argsort(-actual_extents)
+    if not np.array_equal(order, [0, 1, 2]):
+        mesh.vertices = mesh.vertices[:, order]
 
-    if np.linalg.det(rotation) < 0:
-        rotation[2] *= -1
-
-    mesh.vertices = mesh.vertices @ rotation.T
+    # Re-center at origin
+    mesh.vertices -= mesh.vertices.mean(axis=0)
     return mesh
 
 
