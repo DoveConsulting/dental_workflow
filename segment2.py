@@ -70,7 +70,8 @@ def compute_mesh_outline(
     grid_res: float = 0.1,
 ) -> np.ndarray:
     """Compute the Z-projection outline by rasterising all mesh vertices
-    onto a 2D grid, closing small gaps, and tracing the outer contour.
+    onto a 2D grid, closing small gaps, and tracing the outer contour
+    using 8-connected grid adjacency (no shortcuts across the interior).
 
     *grid_res* is the cell size (mm).  Smaller = more detail, larger = smoother.
 
@@ -99,61 +100,103 @@ def compute_mesh_outline(
     grid = binary_dilation(grid, structure=struct, iterations=2)
     grid = binary_erosion(grid, structure=struct, iterations=2)
 
-    # Boundary = filled cells with at least one empty 4-neighbour
-    interior = binary_erosion(grid, structure=np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=bool))
-    boundary = grid & ~interior
-
-    by, bx = np.where(boundary)
-    if len(bx) == 0:
+    # Trace outer contour on the filled grid using Moore boundary tracing
+    contour_rc = _trace_outer_contour(grid)
+    if len(contour_rc) == 0:
         return np.empty((0, 3))
 
-    boundary_xy = np.column_stack([
-        xmin + bx * grid_res,
-        ymin + by * grid_res,
+    # Convert grid (row, col) back to world XY
+    outline_xy = np.column_stack([
+        xmin + contour_rc[:, 1] * grid_res,
+        ymin + contour_rc[:, 0] * grid_res,
     ])
 
-    # Order boundary points by nearest-neighbour walk
-    ordered = _order_nearest_neighbour(boundary_xy)
-    return np.column_stack([ordered, np.zeros(len(ordered))])
+    return np.column_stack([outline_xy, np.zeros(len(outline_xy))])
 
 
-def _order_nearest_neighbour(pts: np.ndarray) -> np.ndarray:
-    """Order 2D points into a loop via greedy nearest-neighbour walk."""
-    from scipy.spatial import cKDTree
+def _trace_outer_contour(grid: np.ndarray) -> np.ndarray:
+    """Trace the outer boundary of a filled binary grid using Moore
+    neighbourhood tracing.  Walks along 8-connected boundary pixels
+    in order — cannot jump across the interior.
 
-    n = len(pts)
-    if n < 3:
-        return pts
+    Returns an Mx2 array of (row, col) indices forming the closed contour.
+    """
+    ny, nx = grid.shape
 
-    tree = cKDTree(pts)
-    visited = np.zeros(n, dtype=bool)
-
-    # Start from the point with smallest x
-    start = int(np.argmin(pts[:, 0]))
-    order = [start]
-    visited[start] = True
-
-    for _ in range(n - 1):
-        cur = order[-1]
-        # Query enough neighbours to find an unvisited one
-        k = min(32, n)
-        dists, idxs = tree.query(pts[cur], k=k)
-        found = False
-        for idx in idxs:
-            if not visited[idx]:
-                order.append(int(idx))
-                visited[idx] = True
-                found = True
+    # Find starting boundary pixel: topmost row with a filled cell,
+    # leftmost filled cell in that row.  This is guaranteed to be on
+    # the outer boundary.
+    start = None
+    for y in range(ny):
+        for x in range(nx):
+            if grid[y, x]:
+                start = (y, x)
                 break
-        if not found:
-            # Brute-force fallback
-            d = np.linalg.norm(pts - pts[cur], axis=1)
-            d[visited] = np.inf
-            nxt = int(np.argmin(d))
-            order.append(nxt)
-            visited[nxt] = True
+        if start is not None:
+            break
 
-    return pts[order]
+    if start is None:
+        return np.empty((0, 2), dtype=int)
+
+    # 8-connectivity clockwise: E, SE, S, SW, W, NW, N, NE
+    dy = np.array([0, 1, 1, 1, 0, -1, -1, -1])
+    dx = np.array([1, 1, 0, -1, -1, -1, 0, 1])
+
+    # Boundary pixel = filled cell with at least one empty 4-neighbour
+    def is_boundary(y, x):
+        if not grid[y, x]:
+            return False
+        for ddy, ddx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            ny2, nx2 = y + ddy, x + ddx
+            if ny2 < 0 or ny2 >= ny or nx2 < 0 or nx2 >= nx or not grid[ny2, nx2]:
+                return True
+        return False
+
+    contour = [start]
+    visited = np.zeros((ny, nx), dtype=bool)
+    visited[start[0], start[1]] = True
+    current = start
+    # We came from the west (since start is leftmost in its row)
+    last_dir = 0  # arrived heading east
+
+    max_steps = ny * nx  # safety limit
+
+    while len(contour) < max_steps:
+        # Search clockwise starting from (last_dir + 5) % 8
+        # This is ~135° back from the direction of travel, ensuring we
+        # hug the boundary tightly.
+        search_start = (last_dir + 5) % 8
+        found_next = False
+
+        for i in range(8):
+            d = (search_start + i) % 8
+            ny2 = current[0] + dy[d]
+            nx2 = current[1] + dx[d]
+
+            if ny2 < 0 or ny2 >= ny or nx2 < 0 or nx2 >= nx:
+                continue
+            if not grid[ny2, nx2]:
+                continue
+
+            # Check if we completed the loop (back to start)
+            if (ny2, nx2) == start and len(contour) > 2:
+                return np.array(contour)
+
+            if visited[ny2, nx2]:
+                continue
+
+            if is_boundary(ny2, nx2):
+                contour.append((ny2, nx2))
+                visited[ny2, nx2] = True
+                current = (ny2, nx2)
+                last_dir = d
+                found_next = True
+                break
+
+        if not found_next:
+            break
+
+    return np.array(contour)
 
 
 # ── 5. Detect narrowing regions ───────────────────────────────────────────
@@ -445,7 +488,7 @@ class OutlineApp:
 
         # Show options
         self._show_mesh_cb = gui.Checkbox("Show mesh")
-        self._show_mesh_cb.checked = True
+        self._show_mesh_cb.checked = False
         self._panel.add_child(self._show_mesh_cb)
 
         self._show_outline_cb = gui.Checkbox("Show outline")
