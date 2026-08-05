@@ -224,7 +224,7 @@ def _trace_outer_contour(grid: np.ndarray) -> np.ndarray:
 
 def find_narrowings(
     outline: np.ndarray,
-    width_ratio: float = 1.0,
+    min_prominence: float = 0.7,
     min_arc_gap: float = 0.25,
     sigma: float = 3.0,
 ) -> list[dict]:
@@ -242,13 +242,16 @@ def find_narrowings(
       3. Locate zero-crossings where dw/ds goes from negative to positive
          (transition from decreasing to increasing width → local minimum).
       4. Confirm with second derivative d²w/ds² > 0 (concave-up).
-      5. Keep only minima below *width_ratio* × median width.
+      5. Filter by prominence: only keep minima whose depth (height of the
+         nearest surrounding maximum minus the minimum value) exceeds
+         *min_prominence* (in mm).
 
     Returns a list of dicts with keys:
-        'index'    – index into *outline*
-        'point'    – the outline point at the narrowing
-        'opposite' – the closest opposing outline point
-        'width'    – the smoothed width value at the minimum
+        'index'      – index into *outline*
+        'point'      – the outline point at the narrowing
+        'opposite'   – the closest opposing outline point
+        'width'      – the smoothed width value at the minimum
+        'prominence' – depth of the dip relative to surrounding maxima
     """
     from scipy.ndimage import gaussian_filter1d
     from scipy.spatial import cKDTree
@@ -268,7 +271,6 @@ def find_narrowings(
 
     # ── Vectorised width computation ──
     tree = cKDTree(outline)
-    # Query many neighbours at once and filter by arc distance
     k = min(n, max(64, int(n * 0.4)))
     dists_all, idxs_all = tree.query(outline, k=k)
 
@@ -276,18 +278,16 @@ def find_narrowings(
     closest_idx = np.zeros(n, dtype=int)
 
     for i in range(n):
-        for rank in range(1, k):  # skip rank 0 (self)
+        for rank in range(1, k):
             j = idxs_all[i, rank]
             d_arc_fwd = abs(arc[j] - arc[i])
             d_arc = min(d_arc_fwd, total_arc - d_arc_fwd)
             if d_arc < gap:
                 continue
-            # First valid non-adjacent neighbour by Euclidean distance
             widths[i] = dists_all[i, rank]
             closest_idx[i] = j
             break
 
-    # Replace inf with 0
     widths[widths == np.inf] = 0
 
     # ── Gaussian smoothing (circular / wrap mode) ──
@@ -317,26 +317,74 @@ def find_narrowings(
             continue
         d2w[i] = (w[ip] - 2 * w[i] + w[im]) / (ds_avg * ds_avg)
 
-    # ── Find zero-crossings of dw (negative → positive = local minimum) ──
-    threshold = width_ratio * (np.median(w[w > 0]) if np.any(w > 0) else 1.0)
-
+    # ── Find all local minima and maxima via zero-crossings ──
     minima_indices = []
     for i in range(n):
         im = (i - 1) % n
         if dw[im] < 0 and dw[i] >= 0 and d2w[i] > 0:
-            # Confirmed local minimum; check threshold
-            if 0 < w[i] < threshold:
+            if w[i] > 0:
                 minima_indices.append(i)
 
-    # ── Build result dicts ──
+    maxima_indices = []
+    for i in range(n):
+        im = (i - 1) % n
+        if dw[im] > 0 and dw[i] <= 0:
+            maxima_indices.append(i)
+
+    if not minima_indices:
+        return []
+
+    # ── Compute prominence for each minimum ──
+    # Prominence = min(left_max, right_max) - min_value
+    # where left_max/right_max are the highest maxima on each side
+    # before reaching a lower minimum.
+    def _compute_prominence(min_idx: int) -> float:
+        min_val = w[min_idx]
+
+        # Search left (decreasing index, wrapping) for the nearest maximum
+        left_max = min_val
+        idx = (min_idx - 1) % n
+        steps = 0
+        while steps < n:
+            if idx in maxima_set:
+                left_max = w[idx]
+                break
+            if idx in minima_set and w[idx] < min_val:
+                break
+            idx = (idx - 1) % n
+            steps += 1
+
+        # Search right (increasing index, wrapping) for the nearest maximum
+        right_max = min_val
+        idx = (min_idx + 1) % n
+        steps = 0
+        while steps < n:
+            if idx in maxima_set:
+                right_max = w[idx]
+                break
+            if idx in minima_set and w[idx] < min_val:
+                break
+            idx = (idx + 1) % n
+            steps += 1
+
+        ref = min(left_max, right_max)
+        return ref - min_val
+
+    minima_set = set(minima_indices)
+    maxima_set = set(maxima_indices)
+
+    # ── Filter by prominence ──
     narrowings = []
     for i in minima_indices:
-        narrowings.append({
-            'index': i,
-            'point': outline[i],
-            'opposite': outline[closest_idx[i]],
-            'width': float(w[i]),
-        })
+        prom = _compute_prominence(i)
+        if prom >= min_prominence:
+            narrowings.append({
+                'index': i,
+                'point': outline[i],
+                'opposite': outline[closest_idx[i]],
+                'width': float(w[i]),
+                'prominence': float(prom),
+            })
 
     # ── Deduplicate symmetric pairs ──
     if len(narrowings) > 1:
@@ -453,7 +501,7 @@ class OutlineApp:
 
     def __init__(self, stl_path: str | None = None, grid_res: float = 0.1,
                  num_samples: int = 10000, wireframe: bool = False,
-                 width_ratio: float = 1.0, min_arc_gap: float = 0.25):
+                 min_prominence: float = 0.7, min_arc_gap: float = 0.25):
         self._mesh: trimesh.Trimesh | None = None
         self._outline: np.ndarray | None = None
 
@@ -531,12 +579,12 @@ class OutlineApp:
         sep3 = gui.Label("─── Narrowing ───")
         self._panel.add_child(sep3)
 
-        # Width ratio
-        self._panel.add_child(gui.Label("Width ratio"))
-        self._width_ratio_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
-        self._width_ratio_edit.double_value = width_ratio
-        self._width_ratio_edit.set_limits(0.01, 2.0)
-        self._panel.add_child(self._width_ratio_edit)
+        # Min prominence
+        self._panel.add_child(gui.Label("Min prominence"))
+        self._min_prom_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+        self._min_prom_edit.double_value = min_prominence
+        self._min_prom_edit.set_limits(0.0, 20.0)
+        self._panel.add_child(self._min_prom_edit)
 
         # Min arc gap
         self._panel.add_child(gui.Label("Min arc gap"))
@@ -673,9 +721,9 @@ class OutlineApp:
 
         # Narrowing lines
         if self._show_narrowings_cb.checked and len(outline) > 5:
-            width_ratio = self._width_ratio_edit.double_value
+            min_prominence = self._min_prom_edit.double_value
             min_arc_gap = self._min_arc_gap_edit.double_value
-            narrowings = find_narrowings(outline, width_ratio=width_ratio,
+            narrowings = find_narrowings(outline, min_prominence=min_prominence,
                                          min_arc_gap=min_arc_gap)
             ls = make_narrowing_geometry(narrowings)
             if len(narrowings) > 0:
@@ -710,8 +758,8 @@ def main():
                         help="Number of surface samples (default: 10000)")
     parser.add_argument("--wireframe", action="store_true",
                         help="Render mesh as wireframe")
-    parser.add_argument("--width-ratio", type=float, default=1.0,
-                        help="Width ratio threshold for narrowings (default: 1.0)")
+    parser.add_argument("--min-prominence", type=float, default=0.5,
+                        help="Min prominence (mm) for narrowing detection (default: 0.5)")
     parser.add_argument("--min-arc-gap", type=float, default=0.1,
                         help="Min arc-length fraction to skip neighbours (default: 0.1)")
     args = parser.parse_args()
@@ -721,7 +769,7 @@ def main():
         grid_res=args.grid_res,
         num_samples=args.num_samples,
         wireframe=args.wireframe,
-        width_ratio=args.width_ratio,
+        min_prominence=args.min_prominence,
         min_arc_gap=args.min_arc_gap,
     )
     app.run()
